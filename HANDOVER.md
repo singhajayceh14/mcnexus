@@ -1,6 +1,6 @@
 # MCNexus — Handover
 
-**Version:** 1.0.0 · **Rule set:** v2.0 · **Date:** 30 Sep 2026
+**Version:** 1.0.0 · **Rule set:** v2.1 · **Date:** 30 Sep 2026
 
 ## 1. Summary
 MCNexus connects to a Salesforce Marketing Cloud Engagement org through a server-to-server installed package. It collects metadata across Business Units using read-only calls, builds a dependency graph, runs 19 rules and presents the results as:
@@ -104,10 +104,14 @@ Coverage is the share of successful collection calls per module.
 | POST | /api/scans | Start a scan `{connId, mids[], modules[], mode, naming}` |
 | GET | /api/jobs/:id · POST /api/jobs/:id/cancel | Progress polling and cancellation |
 
-## 6. Rule catalog (v2.0)
+## 6. Rule catalog (v2.1)
 DE-RET-001, DE-PK-001, DE-ORP-001, SQL-001, SQL-007, SQL-TGT-001, SQL-SRC-001, AUTO-FAIL-002, AUTO-STL-001, AUTO-EMP-001, JRN-COR-004, JRN-ENT-001, JRN-VER-002, CP-002, SEC-SCR-001, USR-INA-001, CNT-REF-002, CNT-DE-001, GOV-NAM-001.
 
 Severity overrides and enable/disable are set in **Admin → Rules** and apply from the next scan. Naming patterns (**Admin → Rules → Naming**) drive GOV-NAM-001.
+
+**Changes in v2.1** (no finding IDs changed):
+- SQL-TGT-001, SQL-SRC-001, JRN-ENT-001 and CNT-DE-001 only report a DE as missing when that Business Unit's DE list was collected. `ENT.` names need the Enterprise BU to have been scanned. Before, a scan without Data, a BU whose DE retrieve failed, or a child-BU-only scan reported every reference as missing.
+- DE-ORP-001 only runs when SQL, Automation, Journey, Content and CloudPages all ran without failures. Before, a Quick Scan marked every DE unchanged for a year as orphaned. The scan log notes when the check is skipped.
 
 ## 7. Status and known limitations
 - **Not yet validated against a live tenant.**

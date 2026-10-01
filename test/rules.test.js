@@ -195,7 +195,7 @@ describe('clean org', () => {
 describe('gating and overrides', () => {
   test('rules only run for selected modules', () => {
     const { rules } = run(dirtyOrg(), { mods: ['Data'], naming: DIRTY_NAMING });
-    assert.deepEqual([...new Set(rules)].sort(), ['DE-ORP-001', 'DE-PK-001', 'DE-RET-001']);
+    assert.deepEqual([...new Set(rules)].sort(), ['DE-PK-001', 'DE-RET-001'], 'no orphan verdict without the link-producing modules');
   });
   test('a disabled rule is skipped and a severity override applies', () => {
     const { ds, rules } = run(dirtyOrg(), { rulesX: { 'SQL-001': { enabled: false }, 'DE-ORP-001': { sev: 'HIGH' } } });
@@ -217,5 +217,39 @@ describe('gating and overrides', () => {
   test('API users and inactive users are not counted as dormant', () => {
     const M = empty(); M.users.push(user('1', OLD, { IsAPIUser: 'true' }), user('2', OLD, { ActiveFlag: 'false' }));
     assert.deepEqual(run(M).rules, []);
+  });
+});
+
+describe('no "missing" verdicts without the data to back them', () => {
+  const MISSING_RULES = ['SQL-TGT-001', 'SQL-SRC-001', 'JRN-ENT-001', 'CNT-DE-001'];
+  test('dirty org without the Data module raises no missing-DE findings', () => {
+    const { rules } = run(dirtyOrg(), { mods: MODULES.filter(m => m !== 'Data') });
+    for (const r of MISSING_RULES) assert.ok(!rules.includes(r), r);
+    assert.ok(rules.includes('SQL-001'), 'other SQL rules still run');
+  });
+  test('a BU whose DE retrieve failed raises no missing-DE findings', () => {
+    const M = dirtyOrg(); M.deDone = [];
+    const { rules } = run(M);
+    for (const r of MISSING_RULES) assert.ok(!rules.includes(r), r);
+  });
+  test('ENT. references are not "missing" when the enterprise BU was not scanned', () => {
+    const M = empty(), CHILD = '200', child = { mid: CHILD, name: 'Child', short: 'Child', parentMid: ENT, parent: 'Acme' };
+    M.des.push(de({ ck: 't', name: 'T', mid: CHILD, bu: 'Child' })); M.fields[CHILD + '|t'] = fields('K*');
+    M.queries.push(q({ ck: 'q', name: 'Q', mid: CHILD, bu: 'Child', text: 'SELECT K FROM ENT.Shared_Lookup', targetName: 'T', targetCk: 't' }));
+    M.content.push(cnt({ id: '1', ck: 'e', name: 'E', mid: CHILD, bu: 'Child', text: '%%=Lookup("ENT.Shared_Lookup","K","K","1")=%%' }));
+    M.deDone = [CHILD];
+    assert.deepEqual(run(M, { bus: [child] }).rules, []);
+    M.deDone = [CHILD, ENT];   // enterprise DEs collected and still absent → genuinely missing
+    assert.deepEqual(run(M, { bus: [child] }).rules.sort(), ['CNT-DE-001', 'SQL-SRC-001']);
+  });
+  test('Quick Scan modules do not mark DEs as orphaned', () => {
+    const { rules, log } = run(dirtyOrg(), { mods: ['Organization', 'Security', 'Data', 'Automation'] });
+    assert.ok(!rules.includes('DE-ORP-001'));
+    assert.ok(log.some(m => /Orphan check \(DE-ORP-001\) skipped/.test(m)));
+  });
+  test('a failure in a link-producing module suppresses orphan verdicts', () => {
+    const M = dirtyOrg(), cov = {}; MODULES.forEach(m => cov[m] = { ok: 1, fail: m === 'Journey' ? 1 : 0, notes: [] });
+    const ds = analyze(M, { bus: [BU], allBus: [BU], entMid: ENT, mods: new Set(MODULES), cov, naming: null, rulesX: {}, L: () => { }, job: { counts: {} } });
+    assert.ok(!ds.findings.some(f => f.rule === 'DE-ORP-001'));
   });
 });

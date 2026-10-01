@@ -5,7 +5,7 @@ const http = require('http'), fs = require('fs'), path = require('path'), crypto
 
 const PORT = +process.env.PORT || 8787, HOST = process.env.HOST || '127.0.0.1';
 const ROOT = path.resolve(__dirname, '..'), DATA = process.env.MCNEXUS_DATA || path.join(__dirname, 'data');
-const RULESET = '2.0', VERSION = '1.0.0';
+const RULESET = '2.1', VERSION = '1.0.0';
 const ENV_LIM = { maxPages: +process.env.MCNEXUS_MAX_PAGES || 40, maxDetail: +process.env.MCNEXUS_MAX_DETAIL || 400, concurrency: +process.env.MCNEXUS_CONCURRENCY || 6 };
 let MAX_PAGES = ENV_LIM.maxPages, MAX_DETAIL = ENV_LIM.maxDetail, CONCURRENCY = ENV_LIM.concurrency; // overridden by Settings → Scan defaults
 const STARTED = Date.now();
@@ -268,7 +268,7 @@ async function runScan(job, conn, opts) {
   const setMod = (m, st) => { job.mods[m] = st; };
   const check = () => { if (job.cancelled) throw new ApiErr('Cancelled by user', 0, 'cancel'); };
   MODULES.forEach(m => job.mods[m] = mods.has(m) ? 'QUEUED' : 'SKIPPED');
-  const M = { des: [], fields: {}, folders: {}, queries: [], autos: [], imports: [], scripts: [], journeys: [], evs: [], content: [], users: [] };
+  const M = { des: [], fields: {}, folders: {}, queries: [], autos: [], imports: [], scripts: [], journeys: [], evs: [], content: [], users: [], deDone: [] };
 
   // Organization
   job.cur = 'Organization'; setMod('Organization', 'RUNNING');
@@ -302,7 +302,7 @@ async function runScan(job, conn, opts) {
       try {
         const des = await api.retrieveSafe(mid, 'DataExtension', ['ObjectID', 'CustomerKey', 'Name', 'IsSendable', 'CategoryID', 'CreatedDate', 'ModifiedDate', 'DataRetentionPeriodLength', 'DataRetentionPeriod', 'RowBasedRetention', 'RetainUntil', 'DeleteAtEndOfRetentionPeriod', 'Description', 'SendableDataExtensionField.Name', 'SendableSubscriberField.Name'], ['ObjectID', 'CustomerKey', 'Name', 'IsSendable', 'CategoryID', 'CreatedDate', 'ModifiedDate']);
         des.forEach(d => M.des.push(tag({ objectId: d.ObjectID, ck: d.CustomerKey, name: d.Name, sendable: bool(d.IsSendable), categoryId: d.CategoryID, created: d.CreatedDate, modified: d.ModifiedDate, retLen: d.DataRetentionPeriodLength, retPeriod: d.DataRetentionPeriod, rowRet: bool(d.RowBasedRetention), retainUntil: d.RetainUntil, deleteAtEnd: bool(d.DeleteAtEndOfRetentionPeriod), retKnown: d.DataRetentionPeriodLength !== undefined || d.RowBasedRetention !== undefined, desc: d.Description, sendField: dig(d, 'SendableDataExtensionField', 'Name'), subField: dig(d, 'SendableSubscriberField', 'Name') })));
-        L(B + ': ' + plural(des.length, 'Data Extension') + ' (SOAP)'); job.counts.assets += des.length; mark('Data', true);
+        L(B + ': ' + plural(des.length, 'Data Extension') + ' (SOAP)'); job.counts.assets += des.length; mark('Data', true); M.deDone.push(mid);
         try {
           const fs_ = await api.retrieveSafe(mid, 'DataExtensionField', ['Name', 'IsPrimaryKey', 'FieldType', 'IsRequired', 'DataExtension.CustomerKey'], ['Name', 'IsPrimaryKey', 'DataExtension.CustomerKey']);
           fs_.forEach(f => { const k = mid + '|' + dig(f, 'DataExtension', 'CustomerKey'); (M.fields[k] = M.fields[k] || []).push({ name: f.Name, pk: bool(f.IsPrimaryKey), type: f.FieldType }); });
@@ -420,6 +420,12 @@ function analyze(M, o) {
   const cById = idx(M.content, c => c.mid + '|' + c.id), cByIdAny = idx(M.content, c => c.id), cByCk = idx(M.content, c => c.mid + '|' + String(c.ck).toLowerCase()), cByLegacy = idx(M.content, c => c.legacyId ? c.mid + '|' + c.legacyId : null);
   const evByKey = idx(M.evs, e => e.mid + '|' + e.key);
 
+  // "Missing DE" findings are only sound for BUs whose DE list was collected (ENT. names resolve in the enterprise BU).
+  // Hand-built models without deDone count every scanned BU as collected when Data ran.
+  const deDone = new Set(mods.has('Data') ? (M.deDone || bus.map(b => b.mid)) : []);
+  const canMiss = (mid, name) => deDone.has(/^ent./i.test(String(name || '').trim()) ? entMid : mid);
+  // An orphan verdict needs every module that creates DE links to have run without failures.
+  const linksDone = ['SQL', 'Automation', 'Journey', 'Content', 'CloudPages'].every(m => mods.has(m) && cov[m] && !cov[m].fail);
   const F = []; const rx = o.rulesX || {};
   const finding = (rule, a, x) => {
     const r = RULE[rule]; if (!r) return; const ov = rx[rule] || {}; if (ov.enabled === false) return;
@@ -467,17 +473,17 @@ function analyze(M, o) {
   // rules: data
   let rulesRun = 0;
   if (mods.has('Data')) M.des.forEach(d => {
-    const a = A.get(d.key); rulesRun += 3;
+    const a = A.get(d.key); rulesRun += linksDone ? 3 : 2;
     if (d.sendable && d.retKnown && !d.hasRet) finding('DE-RET-001', a, { why: 'Retention is not configured on a sendable data extension. Personal data accumulates indefinitely unless an external process deletes it.', evidence: [['DataRetentionPeriodLength', d.retLen || 'empty'], ['RowBasedRetention', String(d.rowRet)], ['Sendable', 'true'], ['Source', 'SOAP DataExtension retrieve']], affected: blastTxt(d.key), rec: 'Confirm the retention requirement with the data owner and configure row- or DE-level retention.', effort: 'MEDIUM' });
     if (d.sendable && d.pk && d.pk.length === 0) finding('DE-PK-001', a, { why: 'Without a primary key, imports append duplicates and sends may reach the same contact more than once.', evidence: [['Primary key', 'None'], ['Sendable', 'true'], ['Fields', String(d.fieldList.length)]], affected: blastTxt(d.key), like: 'HIGH', rec: 'Define a primary key on the subscriber identifier and de-duplicate existing rows.', limit: 'Row-level data is not read — duplicate rate not measured.' });
-    if (!(out[d.key] || []).length && !(inn[d.key] || []).length && ageDays(d.modified) > 365) finding('DE-ORP-001', a, { why: 'No query, import, journey, script or content reference was found, and the DE has not changed in over a year.', evidence: [['Modified', fmtD(d.modified)], ['Dependencies', 'None found']], affected: '1 Data Extension', like: 'LOW', conf: 'MEDIUM', rec: 'Review with the owner before archiving or deleting.', limit: 'Use by external systems via API is not observable.' });
+    if (linksDone && !(out[d.key] || []).length && !(inn[d.key] || []).length && ageDays(d.modified) > 365) finding('DE-ORP-001', a, { why: 'No query, import, journey, script or content reference was found, and the DE has not changed in over a year.', evidence: [['Modified', fmtD(d.modified)], ['Dependencies', 'None found']], affected: '1 Data Extension', like: 'LOW', conf: 'MEDIUM', rec: 'Review with the owner before archiving or deleting.', limit: 'Use by external systems via API is not observable.' });
   });
   if (mods.has('SQL')) M.queries.forEach(q => {
     const a = A.get(q.key); rulesRun += 4;
     if (/select\s+(top\s+\d+\s+)?(distinct\s+)?\*|,\s*\*\s|\.\*/i.test(q.text)) finding('SQL-001', a, { why: 'Schema changes to the source may silently change what is written to the target.', evidence: [['Statement', q.text.replace(/\s+/g, ' ').slice(0, 140)], ['Target', (q.targetName || '—') + ' · ' + (q.update || '—')]], affected: q.tgt ? blastTxt(q.tgt.key) : '1 Query', rec: 'Select the required columns explicitly.' });
     const dep = sqlDepth(q.text); if (dep > 3) finding('SQL-007', a, { why: 'Deep nesting increases the risk of hitting the 30-minute query timeout.', evidence: [['Depth', String(dep)]], rec: 'Split into staged queries writing to intermediate DEs.', effort: 'MEDIUM' });
-    if (q.targetName && !q.tgt) finding('SQL-TGT-001', a, { why: 'The target data extension could not be found in the scanned Business Units. The query will fail when it runs.', evidence: [['Target', q.targetName], ['Customer key', q.targetCk || '—']], like: 'HIGH', rec: 'Recreate the target DE or repoint the query.', limit: 'Target could live in an unscanned BU.' });
-    const miss = q.srcs.filter(s => !s.d && !s.dv); if (miss.length) finding('SQL-SRC-001', a, { why: 'One or more source tables could not be resolved to a data extension in the scanned BUs.', evidence: [['Unresolved', miss.map(s => s.n).slice(0, 6).join(', ')]], conf: 'MEDIUM', rec: 'Confirm the source exists; use ENT. for shared DEs.', limit: 'Sources in unscanned BUs or aliases may be reported here.' });
+    if (q.targetName && !q.tgt && canMiss(q.mid, q.targetName)) finding('SQL-TGT-001', a, { why: 'The target data extension could not be found in the scanned Business Units. The query will fail when it runs.', evidence: [['Target', q.targetName], ['Customer key', q.targetCk || '—']], like: 'HIGH', rec: 'Recreate the target DE or repoint the query.', limit: 'Target could live in an unscanned BU.' });
+    const miss = q.srcs.filter(s => !s.d && !s.dv && canMiss(q.mid, s.n)); if (miss.length) finding('SQL-SRC-001', a, { why: 'One or more source tables could not be resolved to a data extension in the scanned BUs.', evidence: [['Unresolved', miss.map(s => s.n).slice(0, 6).join(', ')]], conf: 'MEDIUM', rec: 'Confirm the source exists; use ENT. for shared DEs.', limit: 'Sources in unscanned BUs or aliases may be reported here.' });
   });
   if (mods.has('Automation')) M.autos.forEach(a0 => {
     const a = A.get(a0.key); rulesRun += 3;
@@ -490,7 +496,7 @@ function analyze(M, o) {
   });
   if (mods.has('Journey')) M.journeys.forEach(j => {
     const a = A.get(j.key); rulesRun += 3; const running = /published|running/i.test(j.status || '');
-    if (running && j.ev && j.ev.deId && !j.entry) finding('JRN-ENT-001', a, { why: 'The journey is running but its entry data extension could not be found.', evidence: [['Event definition', j.evKey], ['DE id', j.ev.deId], ['DE name', j.ev.deName || '—']], rec: 'Verify the entry source and republish.', conf: 'MEDIUM' });
+    if (running && j.ev && j.ev.deId && !j.entry && canMiss(j.mid, j.ev.deName)) finding('JRN-ENT-001', a, { why: 'The journey is running but its entry data extension could not be found.', evidence: [['Event definition', j.evKey], ['DE id', j.ev.deId], ['DE name', j.ev.deName || '—']], rec: 'Verify the entry source and republish.', conf: 'MEDIUM' });
     if (running && j.entry) {
       const feeders = (inn[j.entry.key] || []).filter(e => e[2] === 'WRITES').map(e => e[0]);
       for (const f of feeders) { const autos = (inn[f] || []).filter(e => e[2] === 'CONTAINS').map(e => A.get(e[0])).filter(x => x && x.raw.err);
@@ -504,7 +510,7 @@ function analyze(M, o) {
   if (mods.has('Security') || mods.has('Automation')) M.scripts.forEach(s => { rulesRun++; const h = secretHit(s.text); if (h) finding('SEC-SCR-001', A.get(s.key), { why: 'A credential-like value is embedded in an SSJS script activity.', evidence: [['Pattern', h.name + ' = "' + h.masked + '"'], ['Approx. line', String(h.line)]], conf: 'MEDIUM', rec: 'Rotate the credential and load it from a protected store.' }); });
   if (mods.has('Content')) M.content.forEach(c => { rulesRun += 2; const a = A.get(c.key);
     if (c.brokenCb.length) finding('CNT-REF-002', a, { why: 'The asset references content blocks that could not be found.', evidence: [['References', c.brokenCb.slice(0, 5).join(', ')]], conf: 'MEDIUM', rec: 'Replace or remove the reference.', limit: 'Shared/other-BU content may not be visible to this package.' });
-    if (c.missing.length) finding('CNT-DE-001', a, { why: 'AMPscript/SSJS references a data extension that could not be resolved.', evidence: [['Unresolved', c.missing.slice(0, 5).join(', ')]], conf: 'MEDIUM', rec: 'Confirm the DE name; use ENT. for shared DEs.', limit: 'Names built dynamically are not resolved.' }); });
+    const cMiss = c.missing.filter(n => canMiss(c.mid, n)); if (cMiss.length) finding('CNT-DE-001', a, { why: 'AMPscript/SSJS references a data extension that could not be resolved.', evidence: [['Unresolved', cMiss.slice(0, 5).join(', ')]], conf: 'MEDIUM', rec: 'Confirm the DE name; use ENT. for shared DEs.', limit: 'Names built dynamically are not resolved.' }); });
   if (mods.has('Security') && M.users.length) {
     rulesRun++;
     const ina = M.users.filter(u => bool(u.ActiveFlag) && !bool(u.IsAPIUser) && ageDays(u.LastSuccessfulLogin) > 90);
@@ -521,6 +527,7 @@ function analyze(M, o) {
         finding('GOV-NAM-001', { key, name: bad.length + ' ' + type + ' names', type: 'Multiple' }, { bu: b.name, objType: type, why: bad.length + ' of ' + list.length + ' ' + type + ' assets do not match the configured pattern.', evidence: [['Pattern', o.naming.find(n => n[0] === pt)[1]], ['Examples', bad.slice(0, 5).map(a => a.name).join(', ')]], affected: plural(bad.length, 'asset'), like: 'HIGH', effort: 'MEDIUM', rec: 'Rename on next change; enforce in the build checklist.' }); }
     }));
   }
+  if (mods.has('Data') && !linksDone) L('Orphan check (DE-ORP-001) skipped — needs SQL, Automation, Journey, Content and CloudPages fully collected');
   job.counts.rules = rulesRun; job.counts.findings = F.length;
   L('Executed ' + RULES.filter(r => !(rx[r[0]] && rx[r[0]].enabled === false)).length + ' rules · ' + rulesRun.toLocaleString('en-US') + ' evaluations · ' + plural(F.length, 'finding'));
 
