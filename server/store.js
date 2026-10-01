@@ -26,10 +26,16 @@
 //   getSession(hash) · listSessions(email)   → session(s), expired ones included (the caller checks)
 //   touchSession(hash, seen, expires) · deleteSession(hash)
 //   deleteSessions(email, exceptHash)        → number ended
-//   purgeExpired(now)                        drops expired sessions and stale sign-in failure counters
+//   purgeExpired(now)                        drops expired sessions, stale sign-in counters and jobs finished > 1 day ago
 //   countFailures(key, now, windowMs)        → { count, resetAt }  failed sign-ins in the current window
 //   recordFailure(key, now, windowMs)        → { count, resetAt }  window starts at the first failure
 //   clearFailures(key)
+//   createJob({ id, connId, state, now })    → { ok: true } | { ok: false, running: jobId } (one running job per connection)
+//   getJob(id)                               → { id, connId, status, state, cancel, leaseUntil } | null
+//   claimJob(id, now, leaseMs)               → job | null — only a running job whose lease is free; takes the lease
+//   saveJob(id, state, status, now)          status 'running' | 'done' | 'failed'; releases the lease
+//   requestCancel(id)                        → true if the job was running
+//   putJobPart(id, seq, data) · getJobPart(id, seq) · deleteJobParts(id)   data: opaque string (gzip+base64)
 //   stats()                                  → { connections, scans, users, bytes, location }
 //   close()
 const fs = require('fs'), path = require('path');
@@ -45,12 +51,15 @@ class JsonStore {
     this.dir = dir; this.file = path.join(dir, 'store.json');
     fs.mkdirSync(path.join(dir, 'scans'), { recursive: true });
     const raw = fs.existsSync(this.file) ? JSON.parse(fs.readFileSync(this.file, 'utf8')) : {};
-    this.db = { users: [], connections: [], scans: {}, triage: {}, settings: {}, sessions: [], ...raw };
+    this.db = { users: [], connections: [], scans: {}, triage: {}, settings: {}, sessions: [], jobs: [], ...raw };
     this.fails = new Map();   // sign-in failures: in memory, as the JSON store is a single process
   }
   _save() { const tmp = this.file + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(this.db, null, 1), { mode: 0o600 }); fs.renameSync(tmp, this.file); }
   _scanPath(cid, n) { return path.join(this.dir, 'scans', cid, n + '.json'); }
   _conn(id) { return this.db.connections.find(c => c.id === id); }
+  _job(id) { return this.db.jobs.find(j => j.id === id); }
+  _partDir(id) { return path.join(this.dir, 'jobs', id); }
+  _dropJobs(pred) { const gone = this.db.jobs.filter(pred); if (!gone.length) return 0; this.db.jobs = this.db.jobs.filter(j => !pred(j)); gone.forEach(j => fs.rmSync(this._partDir(j.id), { recursive: true, force: true })); return gone.length; }
 
   async init() { }
   async close() { }
@@ -70,7 +79,7 @@ class JsonStore {
   async updateConnection(id, patch) { checkKeys(patch, CONN_KEYS, 'connection'); const c = this._conn(id); if (!c) return null; Object.assign(c, clone(patch), { id }); this._save(); return clone(c); }
   async deleteConnection(id) {
     const before = this.db.connections.length;
-    this.db.connections = this.db.connections.filter(c => c.id !== id); delete this.db.scans[id]; delete this.db.triage[id]; this._save();
+    this.db.connections = this.db.connections.filter(c => c.id !== id); delete this.db.scans[id]; delete this.db.triage[id]; this._dropJobs(j => j.connId === id); this._save();
     fs.rmSync(path.join(this.dir, 'scans', id), { recursive: true, force: true });
     return this.db.connections.length < before;
   }
@@ -102,12 +111,27 @@ class JsonStore {
   async purgeExpired(now) {
     const n = this.db.sessions.length; this.db.sessions = this.db.sessions.filter(x => x.expires > now); const d = n - this.db.sessions.length; if (d) this._save();
     for (const [k, v] of this.fails) if (v.start < now - 864e5) this.fails.delete(k);
+    if (this._dropJobs(j => j.status !== 'running' && j.updated < now - 864e5)) this._save();
     return d;
   }
 
   async countFailures(key, now, windowMs) { const v = this.fails.get(key); return v && v.start > now - windowMs ? { count: v.count, resetAt: v.start + windowMs } : { count: 0, resetAt: now }; }
   async recordFailure(key, now, windowMs) { let v = this.fails.get(key); if (!v || v.start <= now - windowMs) v = { count: 0, start: now }; v.count++; this.fails.set(key, v); return { count: v.count, resetAt: v.start + windowMs }; }
   async clearFailures(key) { this.fails.delete(key); }
+
+  async createJob({ id, connId, state, now }) {
+    const run = this.db.jobs.find(j => j.connId === connId && j.status === 'running'); if (run) return { ok: false, running: run.id };
+    if (!this._conn(connId)) throw new Error('connection not found: ' + connId);
+    this.db.jobs.push({ id, connId, status: 'running', state: clone(state), cancel: false, lease: 0, created: now, updated: now }); this._save(); return { ok: true };
+  }
+  _pubJob(j) { return clone({ id: j.id, connId: j.connId, status: j.status, state: j.state, cancel: j.cancel, leaseUntil: j.lease || null }); }
+  async getJob(id) { const j = this._job(id); return j ? this._pubJob(j) : null; }
+  async claimJob(id, now, leaseMs) { const j = this._job(id); if (!j || j.status !== 'running' || j.lease > now) return null; j.lease = now + leaseMs; this._save(); return this._pubJob(j); }
+  async saveJob(id, state, status, now) { const j = this._job(id); if (!j) return false; Object.assign(j, { state: clone(state), status, lease: 0, updated: now }); this._save(); return true; }
+  async requestCancel(id) { const j = this._job(id); if (!j || j.status !== 'running') return false; j.cancel = true; this._save(); return true; }
+  async putJobPart(id, seq, data) { fs.mkdirSync(this._partDir(id), { recursive: true }); fs.writeFileSync(path.join(this._partDir(id), seq + '.txt'), data); }
+  async getJobPart(id, seq) { try { return fs.readFileSync(path.join(this._partDir(id), seq + '.txt'), 'utf8'); } catch { return null; } }
+  async deleteJobParts(id) { fs.rmSync(this._partDir(id), { recursive: true, force: true }); }
 
   async stats() {
     let bytes = 0; const walk = (d) => { try { fs.readdirSync(d, { withFileTypes: true }).forEach(e => { const f = path.join(d, e.name); if (e.isDirectory()) walk(f); else bytes += fs.statSync(f).size; }); } catch { } }; walk(this.dir);

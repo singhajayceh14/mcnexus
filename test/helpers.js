@@ -188,7 +188,7 @@ async function pgliteAdapter() {
   };
 }
 const SCHEMA = () => fs.readFileSync(path.join(__dirname, '..', 'server', 'schema.sql'), 'utf8');
-const PG_TABLES = ['login_attempt', 'password_reset', 'invite', 'app_session', 'triage', 'scan_snapshot', 'scan', 'connection', 'app_setting', 'app_user'];
+const PG_TABLES = ['scan_job_part', 'scan_job', 'login_attempt', 'password_reset', 'invite', 'app_session', 'triage', 'scan_snapshot', 'scan', 'connection', 'app_setting', 'app_user'];
 // Every persisted row as text — used to prove secrets never land in storage in plaintext.
 const pgDump = async (adapter) => { let out = ''; for (const t of PG_TABLES) out += t + ':' + JSON.stringify(await adapter.query(`SELECT * FROM ${t}`, [])) + '\n'; return out; };
 const jsonDump = (dir) => { let out = ''; const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).forEach(e => { const f = path.join(d, e.name); if (e.isDirectory()) walk(f); else out += fs.readFileSync(f, 'utf8') + '\n'; }); walk(dir); return out; };

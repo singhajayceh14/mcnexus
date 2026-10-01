@@ -7,7 +7,7 @@
 //   adapter.close()
 const { SETTING_SECTIONS, CONN_KEYS, checkKeys } = require('./store');
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const FIRST_OWNER_LOCK = 7243100;   // pg_advisory_xact_lock key: serialises concurrent first sign-ins
 
 // connection object key → [column, kind]
@@ -27,6 +27,7 @@ function rowToConn(r) {
 const ms = (v) => new Date(v).getTime();
 const rowToSession = (r) => ({ hash: r.token_hash, email: r.email, created: ms(r.created_at), seen: ms(r.last_seen), expires: ms(r.expires_at), ua: r.user_agent || '', ip: r.ip || '' });
 const SESSION_SELECT = 'SELECT s.*, u.email FROM app_session s JOIN app_user u ON u.id = s.user_id';
+const rowToJob = (r) => ({ id: r.id, connId: r.conn_id, status: r.status, state: r.state, cancel: r.cancel_requested, leaseUntil: r.lease_until ? ms(r.lease_until) : null });
 const rowToUser = (r) => ({ email: r.email, name: r.name, role: r.role, salt: r.pw_salt, hash: r.pw_hash });
 
 class PgStore {
@@ -122,6 +123,7 @@ class PgStore {
     const [s] = await this.db.tx([
       ['DELETE FROM app_session WHERE expires_at <= $1 RETURNING token_hash', [new Date(now)]],
       ['DELETE FROM login_attempt WHERE window_start < $1', [new Date(now - 864e5)]],
+      ["DELETE FROM scan_job WHERE status <> 'running' AND updated_at < $1", [new Date(now - 864e5)]],
     ]);
     return s.length;
   }
@@ -140,6 +142,28 @@ class PgStore {
     return { count: r[0].count, resetAt: ms(r[0].window_start) + windowMs };
   }
   async clearFailures(key) { await this.db.query('DELETE FROM login_attempt WHERE key = $1', [key]); }
+
+  // ---------- scan jobs ----------
+  async createJob({ id, connId, state, now }) {
+    const r = await this.db.query("INSERT INTO scan_job (id, conn_id, state, created_at, updated_at) VALUES ($1, $2, $3::json, $4, $4) ON CONFLICT (conn_id) WHERE status = 'running' DO NOTHING RETURNING id",
+      [id, connId, JSON.stringify(state), new Date(now)]);
+    if (r.length) return { ok: true };
+    const run = await this.db.query("SELECT id FROM scan_job WHERE conn_id = $1 AND status = 'running'", [connId]);
+    return { ok: false, running: run[0] ? run[0].id : null };
+  }
+  async getJob(id) { const r = await this.db.query('SELECT * FROM scan_job WHERE id = $1', [id]); return r[0] ? rowToJob(r[0]) : null; }
+  async claimJob(id, now, leaseMs) {
+    const r = await this.db.query("UPDATE scan_job SET lease_until = $3 WHERE id = $1 AND status = 'running' AND (lease_until IS NULL OR lease_until <= $2) RETURNING *", [id, new Date(now), new Date(now + leaseMs)]);
+    return r[0] ? rowToJob(r[0]) : null;
+  }
+  async saveJob(id, state, status, now) {
+    return (await this.db.query('UPDATE scan_job SET state = $2::json, status = $3, lease_until = NULL, updated_at = $4 WHERE id = $1 RETURNING id', [id, JSON.stringify(state), status, new Date(now)])).length === 1;
+  }
+  async requestCancel(id) { return (await this.db.query("UPDATE scan_job SET cancel_requested = true WHERE id = $1 AND status = 'running' RETURNING id", [id])).length === 1; }
+  async putJobPart(id, seq, data) { await this.db.query('INSERT INTO scan_job_part (job_id, seq, data) VALUES ($1, $2, $3) ON CONFLICT (job_id, seq) DO UPDATE SET data = excluded.data', [id, seq, data]); }
+  // One part per query: the Neon HTTP driver caps request/response size, and parts can be megabytes each.
+  async getJobPart(id, seq) { const r = await this.db.query('SELECT data FROM scan_job_part WHERE job_id = $1 AND seq = $2', [id, seq]); return r[0] ? r[0].data : null; }
+  async deleteJobParts(id) { await this.db.query('DELETE FROM scan_job_part WHERE job_id = $1', [id]); }
 
   async stats() {
     const r = (await this.db.query('SELECT (SELECT count(*) FROM connection)::int AS c, (SELECT count(*) FROM scan)::int AS s, (SELECT count(*) FROM app_user)::int AS u, pg_database_size(current_database())::bigint AS b', []))[0];

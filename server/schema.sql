@@ -1,4 +1,4 @@
--- MCNexus — PostgreSQL schema, version 2. Target: PostgreSQL 14+ (Neon in production, PGlite in tests).
+-- MCNexus — PostgreSQL schema, version 3. Target: PostgreSQL 14+ (Neon in production, PGlite in tests).
 --
 -- Applied by `npm run db:schema` (server/migrate-json-to-pg.js --schema). Idempotent: every statement can be
 -- re-run. Statements end with ';' at the end of a line and contain no other ';' — the Neon HTTP driver runs
@@ -130,3 +130,28 @@ CREATE TABLE IF NOT EXISTS login_attempt (
 );
 
 INSERT INTO schema_version (version) VALUES (2) ON CONFLICT (version) DO NOTHING;
+
+-- ---------- version 3: resumable scan jobs ----------
+-- A scan is a job worked through in short steps (see runStep in mcnexus-server.js). state is json, not jsonb, so
+-- key order survives. lease_until stops two workers running the same step; at most one running job per connection.
+CREATE TABLE IF NOT EXISTS scan_job (
+  id                text        PRIMARY KEY,
+  conn_id           text        NOT NULL REFERENCES connection (id) ON DELETE CASCADE,
+  status            text        NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'done', 'failed')),
+  state             json        NOT NULL,
+  cancel_requested  boolean     NOT NULL DEFAULT false,
+  lease_until       timestamptz,
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  updated_at        timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS scan_job_one_running ON scan_job (conn_id) WHERE status = 'running';
+
+-- What each step collected: a gzipped, base64 JSON fragment of the raw model. Deleted when the job ends.
+CREATE TABLE IF NOT EXISTS scan_job_part (
+  job_id  text     NOT NULL REFERENCES scan_job (id) ON DELETE CASCADE,
+  seq     integer  NOT NULL,
+  data    text     NOT NULL,
+  PRIMARY KEY (job_id, seq)
+);
+
+INSERT INTO schema_version (version) VALUES (3) ON CONFLICT (version) DO NOTHING;

@@ -123,6 +123,39 @@ function contract(name, make) {
       assert.equal(await store.putTriage('missing', { x: {} }), false);
     });
 
+    test('jobs: one running per connection, leases, cancel, parts, purge', async () => {
+      const t = 1_800_000_000_000, st = (k) => ({ zeta: 1, mods: { Security: 'QUEUED', Data: 'QUEUED' }, at: k, log: [{ t: '00:00', m: 'x' }] });
+      assert.deepEqual(await store.createJob({ id: 'j1', connId: 'c1', state: st(0), now: t }), { ok: true });
+      assert.deepEqual(await store.createJob({ id: 'j2', connId: 'c1', state: st(0), now: t }), { ok: false, running: 'j1' });
+      assert.deepEqual(await store.getJob('j1'), { id: 'j1', connId: 'c1', status: 'running', state: st(0), cancel: false, leaseUntil: null });
+      assert.equal(JSON.stringify((await store.getJob('j1')).state), JSON.stringify(st(0)), 'state key order kept');
+      assert.equal(await store.getJob('nope'), null);
+
+      const c = await store.claimJob('j1', t, 60e3);
+      assert.equal(c.leaseUntil, t + 60e3);
+      assert.equal(await store.claimJob('j1', t + 1000, 60e3), null, 'lease held');
+      assert.ok(await store.claimJob('j1', t + 60e3, 60e3), 'expired lease can be taken over');
+      assert.equal(await store.saveJob('j1', st(1), 'running', t + 2000), true);
+      assert.equal((await store.getJob('j1')).leaseUntil, null, 'save releases the lease');
+      assert.equal((await store.getJob('j1')).state.at, 1);
+
+      await store.putJobPart('j1', 0, 'H4sI-part0'); await store.putJobPart('j1', 1, 'part1'); await store.putJobPart('j1', 1, 'part1-retry');
+      assert.deepEqual([await store.getJobPart('j1', 0), await store.getJobPart('j1', 1), await store.getJobPart('j1', 2)], ['H4sI-part0', 'part1-retry', null]);
+
+      assert.equal(await store.requestCancel('j1'), true);
+      assert.equal((await store.getJob('j1')).cancel, true);
+      await store.saveJob('j1', st(2), 'failed', t + 3000);
+      assert.equal(await store.claimJob('j1', t + 999e6, 60e3), null, 'finished jobs are not claimable');
+      assert.equal(await store.requestCancel('j1'), false);
+      assert.deepEqual(await store.createJob({ id: 'j2', connId: 'c1', state: st(0), now: t }), { ok: true }, 'new job once the old one ended');
+      await store.saveJob('j2', st(9), 'done', t + 4000);
+      await store.deleteJobParts('j1');
+      assert.equal(await store.getJobPart('j1', 0), null);
+
+      await store.purgeExpired(t + 4000 + 864e5 + 1);
+      assert.deepEqual([await store.getJob('j1'), await store.getJob('j2')], [null, null], 'finished jobs purged after a day');
+    });
+
     test('stats count what is stored', async () => {
       const s = await store.stats();
       assert.deepEqual([s.connections, s.scans, s.users], [2, 2, 1]);
@@ -173,7 +206,7 @@ describe('PostgreSQL schema', { skip: NO_PGLITE }, () => {
     await assert.rejects(new PgStore(a).init(), /schema is not installed.*db:schema/);
     await a.exec(SCHEMA()); await a.exec(SCHEMA());
     await new PgStore(a).init();
-    assert.deepEqual(await a.query('SELECT version FROM schema_version ORDER BY version', []), [{ version: 1 }, { version: 2 }]);
+    assert.deepEqual(await a.query('SELECT version FROM schema_version ORDER BY version', []), [{ version: 1 }, { version: 2 }, { version: 3 }]);
   });
 
   test('constraints: lower-case emails, known roles and settings sections only', async () => {
