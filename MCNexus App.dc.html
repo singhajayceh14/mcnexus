@@ -72,9 +72,9 @@
       <button data-menu-btn="1" class="btn btn-secondary btn-icon" onClick="{{ openNav }}" aria-label="Open navigation" style="display:none; width:34px; height:34px;"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 6h16"></path><path d="M4 12h16"></path><path d="M4 18h16"></path></svg></button>
       <div style="display:flex; align-items:center; gap:8px; min-width:0;">
         <span style="font-size:10px; letter-spacing:.14em; text-transform:uppercase; color:var(--color-neutral-700);">Org</span>
-        <select class="input" value="{{ orgId }}" onChange="{{ onOrg }}" style="width:auto; min-height:32px; padding:4px 8px;">
+        <sc-raw-select class="input" value="{{ orgId }}" onChange="{{ onOrg }}" style="width:auto; min-height:32px; padding:4px 8px;">
           <sc-for list="{{ orgOptions }}" as="o" hint-placeholder-count="3"><option value="{{ o.value }}">{{ o.label }}</option></sc-for>
-        </select>
+        </sc-raw-select>
       </div>
       <div data-ctx="1" style="display:flex; flex-wrap:wrap; gap:6px; font-size:12px;">
         <span class="tag tag-accent">Scan {{ ctx.scan }} · {{ ctx.date }}</span>
@@ -126,9 +126,9 @@
   <div class="blueprint" style="padding:18px 20px;">
     <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;"><h4 style="margin:0;">Recent scans · {{ org.name }} / {{ org.env }}</h4><button class="btn btn-ghost" onClick="{{ goHistory }}">All history</button></div>
-    <table class="table"><thead><tr><th>Scan</th><th>Date</th><th>Mode</th><th>Health</th><th>Coverage</th><th>Findings</th><th>Rules</th><th>By</th></tr></thead>
-      <tbody><sc-for list="{{ recent }}" as="r" hint-placeholder-count="3"><tr onClick="{{ r.open }}" style="cursor:pointer;"><td style="font-weight:500;">{{ r.id }}</td><td>{{ r.date }}</td><td>{{ r.mode }}</td><td>{{ r.health }}</td><td>{{ r.cov }}%</td><td>{{ r.total }}</td><td>{{ r.rules }}</td><td>{{ r.by }}</td></tr></sc-for></tbody>
-    </table>
+    <sc-raw-table class="table"><sc-raw-thead><sc-raw-tr><sc-raw-th>Scan</sc-raw-th><sc-raw-th>Date</sc-raw-th><sc-raw-th>Mode</sc-raw-th><sc-raw-th>Health</sc-raw-th><sc-raw-th>Coverage</sc-raw-th><sc-raw-th>Findings</sc-raw-th><sc-raw-th>Rules</sc-raw-th><sc-raw-th>By</sc-raw-th></sc-raw-tr></sc-raw-thead>
+      <sc-raw-tbody><sc-for list="{{ recent }}" as="r" hint-placeholder-count="3"><sc-raw-tr onClick="{{ r.open }}" style="cursor:pointer;"><sc-raw-td style="font-weight:500;">{{ r.id }}</sc-raw-td><sc-raw-td>{{ r.date }}</sc-raw-td><sc-raw-td>{{ r.mode }}</sc-raw-td><sc-raw-td>{{ r.health }}</sc-raw-td><sc-raw-td>{{ r.cov }}%</sc-raw-td><sc-raw-td>{{ r.total }}</sc-raw-td><sc-raw-td>{{ r.rules }}</sc-raw-td><sc-raw-td>{{ r.by }}</sc-raw-td></sc-raw-tr></sc-for></sc-raw-tbody>
+    </sc-raw-table>
   </div>
 </section>
 </sc-if>
@@ -315,7 +315,7 @@
         <div style="background:var(--color-bg); padding:10px;"><div style="font-family:var(--font-heading); font-size:32px; line-height:1;">{{ setup.estCov }}%</div><div style="font-size:11px; color:var(--color-neutral-700);">Est. coverage</div></div>
         <div style="background:var(--color-bg); padding:10px;"><div style="font-family:var(--font-heading); font-size:32px; line-height:1;">~{{ setup.estMin }}m</div><div style="font-size:11px; color:var(--color-neutral-700);">Duration</div></div>
         <div style="background:var(--color-bg); padding:10px;"><div style="font-family:var(--font-heading); font-size:32px; line-height:1;">{{ setup.modCount }}</div><div style="font-size:11px; color:var(--color-neutral-700);">Modules</div></div>
-        <div style="background:var(--color-bg); padding:10px;"><div style="font-family:var(--font-heading); font-size:32px; line-height:1;">{{ setup.rules }}</div><div style="font-size:11px; color:var(--color-neutral-700);">Rules · v1.2</div></div>
+        <div style="background:var(--color-bg); padding:10px;"><div style="font-family:var(--font-heading); font-size:32px; line-height:1;">{{ setup.rules }}</div><div style="font-size:11px; color:var(--color-neutral-700);">Rules · {{ rulesetV }}</div></div>
       </div>
       <sc-if value="{{ setup.hasPartial }}" hint-placeholder-val="{{ true }}"><div style="font-size:13px; background:var(--color-accent-100); color:var(--color-accent-900); padding:8px 10px;">CloudPages, Users and Permissions will be collected partially. They will be reported as limitations, not scored as unhealthy.</div></sc-if>
       <div style="font-size:12px; color:var(--color-neutral-700);">Metadata only. Row-level profiling is off. No customer code is executed.</div>
@@ -498,9 +498,9 @@
     <div class="blueprint" style="padding:20px;">
       <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
       <h4 style="margin:0 0 8px;">Domain scores vs {{ prevId }}</h4>
-      <table class="table"><thead><tr><th>Domain</th><th>{{ prevId }}</th><th>Now</th><th>Δ</th><th>Coverage</th><th>Critical</th><th>High</th></tr></thead>
-        <tbody><sc-for list="{{ domains }}" as="d" hint-placeholder-count="9"><tr onClick="{{ d.open }}" style="cursor:pointer;"><td>{{ d.name }}</td><td>{{ d.prev }}</td><td style="font-weight:500;">{{ d.score }}</td><td style="color:var(--color-accent-700);">{{ d.delta }}</td><td>{{ d.cov }}%</td><td>{{ d.crit }}</td><td>{{ d.high }}</td></tr></sc-for></tbody>
-      </table>
+      <sc-raw-table class="table"><sc-raw-thead><sc-raw-tr><sc-raw-th>Domain</sc-raw-th><sc-raw-th>{{ prevId }}</sc-raw-th><sc-raw-th>Now</sc-raw-th><sc-raw-th>Δ</sc-raw-th><sc-raw-th>Coverage</sc-raw-th><sc-raw-th>Critical</sc-raw-th><sc-raw-th>High</sc-raw-th></sc-raw-tr></sc-raw-thead>
+        <sc-raw-tbody><sc-for list="{{ domains }}" as="d" hint-placeholder-count="9"><sc-raw-tr onClick="{{ d.open }}" style="cursor:pointer;"><sc-raw-td>{{ d.name }}</sc-raw-td><sc-raw-td>{{ d.prev }}</sc-raw-td><sc-raw-td style="font-weight:500;">{{ d.score }}</sc-raw-td><sc-raw-td style="color:var(--color-accent-700);">{{ d.delta }}</sc-raw-td><sc-raw-td>{{ d.cov }}%</sc-raw-td><sc-raw-td>{{ d.crit }}</sc-raw-td><sc-raw-td>{{ d.high }}</sc-raw-td></sc-raw-tr></sc-for></sc-raw-tbody>
+      </sc-raw-table>
     </div>
   </div>
   </sc-if>
@@ -577,9 +577,9 @@
     <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
     <h4 style="margin:0 0 4px;">BU configuration comparison</h4>
     <div style="font-size:13px; color:var(--color-neutral-700); margin-bottom:8px;">Highlighted cells differ from the Enterprise baseline.</div>
-    <div style="overflow-x:auto;"><table class="table"><thead><tr><th>BU</th><th>MID</th><th>Timezone</th><th>Locale</th><th>Users</th><th>Packages</th><th>DEs</th><th>Automations</th><th>Journeys</th><th>Health</th></tr></thead>
-      <tbody><sc-for list="{{ bus }}" as="b" hint-placeholder-count="8"><tr onClick="{{ b.select }}" style="cursor:pointer;"><td style="font-weight:500;">{{ b.name }}</td><td>{{ b.mid }}</td><td style="background:{{ b.tzBg }};">{{ b.tz }}</td><td>{{ b.locale }}</td><td>{{ b.users }}</td><td>{{ b.pkgs }}</td><td>{{ b.des }}</td><td>{{ b.autos }}</td><td>{{ b.jrns }}</td><td>{{ b.health }}</td></tr></sc-for></tbody>
-    </table></div>
+    <div style="overflow-x:auto;"><sc-raw-table class="table"><sc-raw-thead><sc-raw-tr><sc-raw-th>BU</sc-raw-th><sc-raw-th>MID</sc-raw-th><sc-raw-th>Timezone</sc-raw-th><sc-raw-th>Locale</sc-raw-th><sc-raw-th>Users</sc-raw-th><sc-raw-th>Packages</sc-raw-th><sc-raw-th>DEs</sc-raw-th><sc-raw-th>Automations</sc-raw-th><sc-raw-th>Journeys</sc-raw-th><sc-raw-th>Health</sc-raw-th></sc-raw-tr></sc-raw-thead>
+      <sc-raw-tbody><sc-for list="{{ bus }}" as="b" hint-placeholder-count="8"><sc-raw-tr onClick="{{ b.select }}" style="cursor:pointer;"><sc-raw-td style="font-weight:500;">{{ b.name }}</sc-raw-td><sc-raw-td>{{ b.mid }}</sc-raw-td><sc-raw-td style="background:{{ b.tzBg }};">{{ b.tz }}</sc-raw-td><sc-raw-td>{{ b.locale }}</sc-raw-td><sc-raw-td>{{ b.users }}</sc-raw-td><sc-raw-td>{{ b.pkgs }}</sc-raw-td><sc-raw-td>{{ b.des }}</sc-raw-td><sc-raw-td>{{ b.autos }}</sc-raw-td><sc-raw-td>{{ b.jrns }}</sc-raw-td><sc-raw-td>{{ b.health }}</sc-raw-td></sc-raw-tr></sc-for></sc-raw-tbody>
+    </sc-raw-table></div>
   </div>
 </section>
 </sc-if>
@@ -614,7 +614,7 @@
         <sc-if value="{{ asset.hasGraph }}" hint-placeholder-val="{{ false }}"><button class="btn btn-secondary" onClick="{{ openAssetDeps }}" style="align-self:flex-start;">Open in dependency explorer</button></sc-if>
       </sc-if>
       <sc-if value="{{ isTabConfig }}" hint-placeholder-val="{{ false }}">
-        <table class="table"><thead><tr><th>Property</th><th>Value</th><th>Source</th></tr></thead><tbody><sc-for list="{{ asset.configRows }}" as="r" hint-placeholder-count="4"><tr><td>{{ r.k }}</td><td style="font-family:ui-monospace,monospace; font-size:13px;">{{ r.v }}</td><td style="color:var(--color-neutral-700); font-size:12px;">SFMC API</td></tr></sc-for></tbody></table>
+        <sc-raw-table class="table"><sc-raw-thead><sc-raw-tr><sc-raw-th>Property</sc-raw-th><sc-raw-th>Value</sc-raw-th><sc-raw-th>Source</sc-raw-th></sc-raw-tr></sc-raw-thead><sc-raw-tbody><sc-for list="{{ asset.configRows }}" as="r" hint-placeholder-count="4"><sc-raw-tr><sc-raw-td>{{ r.k }}</sc-raw-td><sc-raw-td style="font-family:ui-monospace,monospace; font-size:13px;">{{ r.v }}</sc-raw-td><sc-raw-td style="color:var(--color-neutral-700); font-size:12px;">SFMC API</sc-raw-td></sc-raw-tr></sc-for></sc-raw-tbody></sc-raw-table>
       </sc-if>
       <sc-if value="{{ isTabDeps }}" hint-placeholder-val="{{ false }}">
         <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr)); gap:16px;">
@@ -636,14 +636,14 @@
 <sc-if value="{{ sFindings }}" hint-placeholder-val="{{ false }}">
 <section data-screen-label="Findings center" style="display:flex; flex-direction:column; gap:20px;">
   <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:flex-end; gap:16px;">
-    <div><div style="font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--color-accent-700);">Analyze · Scan {{ latest.id }}</div><h2 style="margin:4px 0 0;">Findings</h2><div style="font-size:14px; color:var(--color-neutral-700);">{{ fCount }} shown from the sample · 151 total in scan</div></div>
+    <div><div style="font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--color-accent-700);">Analyze · Scan {{ latest.id }}</div><h2 style="margin:4px 0 0;">Findings</h2><div style="font-size:14px; color:var(--color-neutral-700);">{{ fSummary }}</div></div>
     <div class="seg"><sc-for list="{{ findVariants }}" as="v" hint-placeholder-count="2"><button onClick="{{ v.onClick }}" style="all:unset; cursor:pointer; padding:7px 12px; font-size:13px; display:flex; gap:6px; align-items:center; background:{{ v.bg }}; color:{{ v.fg }}; border-right:1px solid var(--color-divider);"><b style="font-family:var(--font-heading);">{{ v.id }}</b>{{ v.label }}</button></sc-for></div>
   </div>
   <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
     <sc-for list="{{ sevChips }}" as="c" hint-placeholder-count="5"><button onClick="{{ c.toggle }}" style="all:unset; cursor:pointer; padding:5px 10px; font-size:12px; letter-spacing:.06em; border:1px solid {{ c.bd }}; background:{{ c.bg }}; color:{{ c.fg }}; display:flex; gap:8px;">{{ c.label }}<span style="opacity:.8;">{{ c.total }}</span></button></sc-for>
-    <select class="input" value="{{ fDomain }}" onChange="{{ onFDomain }}" style="width:auto; min-height:32px; padding:4px 8px;"><sc-for list="{{ domainOpts }}" as="o" hint-placeholder-count="4"><option value="{{ o.v }}">{{ o.l }}</option></sc-for></select>
-    <select class="input" value="{{ fBu }}" onChange="{{ onFBu }}" style="width:auto; min-height:32px; padding:4px 8px;"><sc-for list="{{ buOpts }}" as="o" hint-placeholder-count="4"><option value="{{ o.v }}">{{ o.l }}</option></sc-for></select>
-    <select class="input" value="{{ fStatus }}" onChange="{{ onFStatus }}" style="width:auto; min-height:32px; padding:4px 8px;"><sc-for list="{{ statusOpts }}" as="o" hint-placeholder-count="3"><option value="{{ o.v }}">{{ o.l }}</option></sc-for></select>
+    <sc-raw-select class="input" value="{{ fDomain }}" onChange="{{ onFDomain }}" style="width:auto; min-height:32px; padding:4px 8px;"><sc-for list="{{ domainOpts }}" as="o" hint-placeholder-count="4"><option value="{{ o.v }}">{{ o.l }}</option></sc-for></sc-raw-select>
+    <sc-raw-select class="input" value="{{ fBu }}" onChange="{{ onFBu }}" style="width:auto; min-height:32px; padding:4px 8px;"><sc-for list="{{ buOpts }}" as="o" hint-placeholder-count="4"><option value="{{ o.v }}">{{ o.l }}</option></sc-for></sc-raw-select>
+    <sc-raw-select class="input" value="{{ fStatus }}" onChange="{{ onFStatus }}" style="width:auto; min-height:32px; padding:4px 8px;"><sc-for list="{{ statusOpts }}" as="o" hint-placeholder-count="3"><option value="{{ o.v }}">{{ o.l }}</option></sc-for></sc-raw-select>
     <input class="input" value="{{ fQ }}" onChange="{{ onFQ }}" placeholder="Search title, object, rule" style="max-width:240px; min-height:32px;">
     <button class="btn btn-ghost" onClick="{{ clearFilters }}">Clear</button>
   </div>
@@ -652,13 +652,13 @@
   <sc-if value="{{ isFindA }}" hint-placeholder-val="{{ true }}">
   <div id="2a" class="blueprint" style="padding:4px 12px 12px; overflow-x:auto;">
     <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
-    <table class="table"><thead><tr><th>Severity</th><th>Finding</th><th>Object</th><th>BU</th><th>Domain</th><th>Confidence</th><th>Effort</th><th>Status</th><th>Owner</th></tr></thead>
-      <tbody><sc-for list="{{ fList }}" as="f" hint-placeholder-count="8"><tr onClick="{{ f.open }}" style="cursor:pointer;">
-        <td><span class="tag" style="background:{{ f.sevBg }}; color:{{ f.sevFg }};">{{ f.sev }}</span></td>
-        <td><div style="font-weight:500;">{{ f.title }}</div><div style="font-size:12px; color:var(--color-neutral-700);">{{ f.id }} · {{ f.rule }}</div></td>
-        <td style="font-size:13px; word-break:break-all;">{{ f.obj }}</td><td>{{ f.bu }}</td><td>{{ f.domain }}</td><td>{{ f.conf }}</td><td>{{ f.effort }}</td><td style="font-size:12px;">{{ f.status }}</td><td style="font-size:12px;">{{ f.owner }}</td>
-      </tr></sc-for></tbody>
-    </table>
+    <sc-raw-table class="table"><sc-raw-thead><sc-raw-tr><sc-raw-th>Severity</sc-raw-th><sc-raw-th>Finding</sc-raw-th><sc-raw-th>Object</sc-raw-th><sc-raw-th>BU</sc-raw-th><sc-raw-th>Domain</sc-raw-th><sc-raw-th>Confidence</sc-raw-th><sc-raw-th>Effort</sc-raw-th><sc-raw-th>Status</sc-raw-th><sc-raw-th>Owner</sc-raw-th></sc-raw-tr></sc-raw-thead>
+      <sc-raw-tbody><sc-for list="{{ fList }}" as="f" hint-placeholder-count="8"><sc-raw-tr onClick="{{ f.open }}" style="cursor:pointer;">
+        <sc-raw-td><span class="tag" style="background:{{ f.sevBg }}; color:{{ f.sevFg }};">{{ f.sev }}</span></sc-raw-td>
+        <sc-raw-td><div style="font-weight:500;">{{ f.title }}</div><div style="font-size:12px; color:var(--color-neutral-700);">{{ f.id }} · {{ f.rule }}</div></sc-raw-td>
+        <sc-raw-td style="font-size:13px; word-break:break-all;">{{ f.obj }}</sc-raw-td><sc-raw-td>{{ f.bu }}</sc-raw-td><sc-raw-td>{{ f.domain }}</sc-raw-td><sc-raw-td>{{ f.conf }}</sc-raw-td><sc-raw-td>{{ f.effort }}</sc-raw-td><sc-raw-td style="font-size:12px;">{{ f.status }}</sc-raw-td><sc-raw-td style="font-size:12px;">{{ f.owner }}</sc-raw-td>
+      </sc-raw-tr></sc-for></sc-raw-tbody>
+    </sc-raw-table>
   </div>
   </sc-if>
 
@@ -695,7 +695,7 @@
   <button class="btn btn-ghost" onClick="{{ backToFindings }}" style="align-self:flex-start;">← All findings</button>
   <div class="blueprint" style="padding:22px 24px; display:flex; flex-direction:column; gap:10px;">
     <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
-    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;"><span class="tag" style="background:{{ fd.sevBg }}; color:{{ fd.sevFg }}; font-weight:500;">{{ fd.sev }}</span><span style="font-size:13px; color:var(--color-neutral-700);">{{ fd.id }} · Rule {{ fd.rule }} v1.2 · {{ fd.domain }}</span><span class="tag tag-outline">{{ fd.status }}</span></div>
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;"><span class="tag" style="background:{{ fd.sevBg }}; color:{{ fd.sevFg }}; font-weight:500;">{{ fd.sev }}</span><span style="font-size:13px; color:var(--color-neutral-700);">{{ fd.id }} · Rule {{ fd.rule }} {{ fd.ruleV }} · {{ fd.domain }}</span><span class="tag tag-outline">{{ fd.status }}</span></div>
     <h2 style="margin:0;">{{ fd.title }}</h2>
     <div style="font-size:15px;"><b style="font-weight:500;">{{ fd.obj }}</b> · {{ fd.objType }} · {{ fd.bu }} BU</div>
     <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,96px),1fr)); border:1px solid var(--color-divider); margin-top:6px;">
@@ -727,7 +727,7 @@
       <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
       <div style="font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--color-accent-700);">Actions</div>
       <div style="display:flex; gap:8px; flex-wrap:wrap;"><button class="btn btn-primary" onClick="{{ fdActions.ack }}">{{ fd.ackLabel }}</button><button class="btn btn-secondary" onClick="{{ fdActions.toggleReport }}">{{ fd.reportLabel }}</button></div>
-      <div class="field"><label>Owner</label><select class="input" value="{{ fd.owner }}" onChange="{{ fdActions.onOwner }}"><sc-for list="{{ owners }}" as="o" hint-placeholder-count="4"><option value="{{ o.o }}">{{ o.o }}</option></sc-for></select></div>
+      <div class="field"><label>Owner</label><sc-raw-select class="input" value="{{ fd.owner }}" onChange="{{ fdActions.onOwner }}"><sc-for list="{{ owners }}" as="o" hint-placeholder-count="4"><option value="{{ o.o }}">{{ o.o }}</option></sc-for></sc-raw-select></div>
       <div class="field"><label>Add note</label><textarea class="input" value="{{ noteDraft }}" onChange="{{ onNote }}" placeholder="Context for the client or delivery team"></textarea></div>
       <button class="btn btn-secondary" onClick="{{ fdActions.saveNote }}" style="align-self:flex-start;">Save note</button>
       <sc-if value="{{ fd.hasNotes }}" hint-placeholder-val="{{ false }}"><div style="display:flex; flex-direction:column; gap:6px;"><sc-for list="{{ fd.noteRows }}" as="n" hint-placeholder-count="1"><div style="font-size:13px; border-top:1px solid var(--color-divider); padding-top:6px;">{{ n.t }}</div></sc-for></div></sc-if>
@@ -742,7 +742,7 @@
   <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:flex-end; gap:16px;">
     <div><div style="font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--color-accent-700);">Analyze</div><h2 style="margin:4px 0 0;">Dependency explorer</h2></div>
     <div style="display:flex; flex-wrap:wrap; gap:12px; align-items:center;">
-      <select class="input" value="{{ depAsset }}" onChange="{{ onDepAsset }}" style="width:auto; min-height:34px;"><sc-for list="{{ depOpts }}" as="o" hint-placeholder-count="2"><option value="{{ o.v }}">{{ o.l }}</option></sc-for></select>
+      <sc-raw-select class="input" value="{{ depAsset }}" onChange="{{ onDepAsset }}" style="width:auto; min-height:34px;"><sc-for list="{{ depOpts }}" as="o" hint-placeholder-count="2"><option value="{{ o.v }}">{{ o.l }}</option></sc-for></sc-raw-select>
       <div class="seg"><sc-for list="{{ depVariants }}" as="v" hint-placeholder-count="3"><button onClick="{{ v.onClick }}" style="all:unset; cursor:pointer; padding:7px 12px; font-size:13px; display:flex; gap:6px; align-items:center; background:{{ v.bg }}; color:{{ v.fg }}; border-right:1px solid var(--color-divider);"><b style="font-family:var(--font-heading);">{{ v.id }}</b>{{ v.label }}</button></sc-for></div>
     </div>
   </div>
@@ -801,9 +801,9 @@
     <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
     <h4 style="margin:0 0 4px;">If {{ depAsset }} changes or is retired</h4>
     <div style="font-size:13px; color:var(--color-neutral-700); margin-bottom:8px;">Downstream assets ordered by distance. Candidate for review — never "safe to delete".</div>
-    <table class="table"><thead><tr><th>Distance</th><th>Asset</th><th>Type</th><th>Relationship</th><th>State</th><th>Findings</th></tr></thead>
-      <tbody><sc-for list="{{ blastList }}" as="b" hint-placeholder-count="8"><tr><td>{{ b.lvl }}</td><td style="font-weight:500; word-break:break-all;">{{ b.name }}</td><td>{{ b.type }}</td><td style="font-size:12px; letter-spacing:.04em;">{{ b.rel }}</td><td>{{ b.active }}</td><td><sc-if value="{{ b.hasRisk }}" hint-placeholder-val="{{ false }}"><span class="tag" style="background:{{ b.rBg }}; color:{{ b.rFg }};">{{ b.risk }}</span></sc-if></td></tr></sc-for></tbody>
-    </table>
+    <sc-raw-table class="table"><sc-raw-thead><sc-raw-tr><sc-raw-th>Distance</sc-raw-th><sc-raw-th>Asset</sc-raw-th><sc-raw-th>Type</sc-raw-th><sc-raw-th>Relationship</sc-raw-th><sc-raw-th>State</sc-raw-th><sc-raw-th>Findings</sc-raw-th></sc-raw-tr></sc-raw-thead>
+      <sc-raw-tbody><sc-for list="{{ blastList }}" as="b" hint-placeholder-count="8"><sc-raw-tr><sc-raw-td>{{ b.lvl }}</sc-raw-td><sc-raw-td style="font-weight:500; word-break:break-all;">{{ b.name }}</sc-raw-td><sc-raw-td>{{ b.type }}</sc-raw-td><sc-raw-td style="font-size:12px; letter-spacing:.04em;">{{ b.rel }}</sc-raw-td><sc-raw-td>{{ b.active }}</sc-raw-td><sc-raw-td><sc-if value="{{ b.hasRisk }}" hint-placeholder-val="{{ false }}"><span class="tag" style="background:{{ b.rBg }}; color:{{ b.rFg }};">{{ b.risk }}</span></sc-if></sc-raw-td></sc-raw-tr></sc-for></sc-raw-tbody>
+    </sc-raw-table>
   </div>
   </sc-if>
 </section>
@@ -851,7 +851,7 @@
   </sc-if>
   <sc-if value="{{ isDRel }}" hint-placeholder-val="{{ false }}">
     <div class="blueprint" style="padding:16px 18px;"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
-      <table class="table"><thead><tr><th>From</th><th>Cardinality</th><th>To</th><th>Join</th></tr></thead><tbody><sc-for list="{{ relTable }}" as="r" hint-placeholder-count="5"><tr><td style="font-weight:500;">{{ r.a }}</td><td style="font-family:var(--font-heading); font-size:16px;">{{ r.card }}</td><td>{{ r.b }}</td><td style="font-family:ui-monospace,monospace; font-size:12px;">{{ r.on }}</td></tr></sc-for></tbody></table>
+      <sc-raw-table class="table"><sc-raw-thead><sc-raw-tr><sc-raw-th>From</sc-raw-th><sc-raw-th>Cardinality</sc-raw-th><sc-raw-th>To</sc-raw-th><sc-raw-th>Join</sc-raw-th></sc-raw-tr></sc-raw-thead><sc-raw-tbody><sc-for list="{{ relTable }}" as="r" hint-placeholder-count="5"><sc-raw-tr><sc-raw-td style="font-weight:500;">{{ r.a }}</sc-raw-td><sc-raw-td style="font-family:var(--font-heading); font-size:16px;">{{ r.card }}</sc-raw-td><sc-raw-td>{{ r.b }}</sc-raw-td><sc-raw-td style="font-family:ui-monospace,monospace; font-size:12px;">{{ r.on }}</sc-raw-td></sc-raw-tr></sc-for></sc-raw-tbody></sc-raw-table>
     </div>
   </sc-if>
 </section>
@@ -864,12 +864,12 @@
   </div>
   <div class="blueprint" style="padding:4px 12px 12px; overflow-x:auto;">
     <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
-    <table class="table"><thead><tr><th></th><th>Scan</th><th>Date</th><th>Mode</th><th>Health</th><th>Coverage</th><th>Critical</th><th>High</th><th>Total findings</th><th>Assets</th><th>Rules</th><th>By</th></tr></thead>
-      <tbody><sc-for list="{{ hist }}" as="h" hint-placeholder-count="4"><tr>
-        <td><input type="checkbox" checked="{{ h.checked }}" onChange="{{ h.toggle }}" style="accent-color:var(--color-accent); width:16px; height:16px;"></td>
-        <td style="font-family:var(--font-heading); font-size:18px;">{{ h.id }}</td><td>{{ h.date }}</td><td>{{ h.mode }}</td><td style="font-weight:500;">{{ h.health }}</td><td>{{ h.cov }}%</td><td>{{ h.crit }}</td><td>{{ h.high }}</td><td>{{ h.total }}</td><td>{{ h.assets }}</td><td>{{ h.rules }}</td><td>{{ h.by }}</td>
-      </tr></sc-for></tbody>
-    </table>
+    <sc-raw-table class="table"><sc-raw-thead><sc-raw-tr><sc-raw-th></sc-raw-th><sc-raw-th>Scan</sc-raw-th><sc-raw-th>Date</sc-raw-th><sc-raw-th>Mode</sc-raw-th><sc-raw-th>Health</sc-raw-th><sc-raw-th>Coverage</sc-raw-th><sc-raw-th>Critical</sc-raw-th><sc-raw-th>High</sc-raw-th><sc-raw-th>Total findings</sc-raw-th><sc-raw-th>Assets</sc-raw-th><sc-raw-th>Rules</sc-raw-th><sc-raw-th>By</sc-raw-th></sc-raw-tr></sc-raw-thead>
+      <sc-raw-tbody><sc-for list="{{ hist }}" as="h" hint-placeholder-count="4"><sc-raw-tr>
+        <sc-raw-td><input type="checkbox" checked="{{ h.checked }}" onChange="{{ h.toggle }}" style="accent-color:var(--color-accent); width:16px; height:16px;"></sc-raw-td>
+        <sc-raw-td style="font-family:var(--font-heading); font-size:18px;">{{ h.id }}</sc-raw-td><sc-raw-td>{{ h.date }}</sc-raw-td><sc-raw-td>{{ h.mode }}</sc-raw-td><sc-raw-td style="font-weight:500;">{{ h.health }}</sc-raw-td><sc-raw-td>{{ h.cov }}%</sc-raw-td><sc-raw-td>{{ h.crit }}</sc-raw-td><sc-raw-td>{{ h.high }}</sc-raw-td><sc-raw-td>{{ h.total }}</sc-raw-td><sc-raw-td>{{ h.assets }}</sc-raw-td><sc-raw-td>{{ h.rules }}</sc-raw-td><sc-raw-td>{{ h.by }}</sc-raw-td>
+      </sc-raw-tr></sc-for></sc-raw-tbody>
+    </sc-raw-table>
   </div>
 </section>
 </sc-if>
@@ -879,9 +879,9 @@
   <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:flex-end; gap:16px;">
     <div><div style="font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--color-accent-700);">Assess</div><h2 style="margin:4px 0 0;">Compare scans</h2></div>
     <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-      <select class="input" value="{{ cmpA }}" onChange="{{ onCmpA }}" style="width:auto; min-height:34px;"><sc-for list="{{ scanOpts }}" as="o" hint-placeholder-count="4"><option value="{{ o.value }}">{{ o.label }}</option></sc-for></select>
+      <sc-raw-select class="input" value="{{ cmpA }}" onChange="{{ onCmpA }}" style="width:auto; min-height:34px;"><sc-for list="{{ scanOpts }}" as="o" hint-placeholder-count="4"><option value="{{ o.value }}">{{ o.label }}</option></sc-for></sc-raw-select>
       <span style="color:var(--color-accent);">→</span>
-      <select class="input" value="{{ cmpB }}" onChange="{{ onCmpB }}" style="width:auto; min-height:34px;"><sc-for list="{{ scanOpts }}" as="o" hint-placeholder-count="4"><option value="{{ o.value }}">{{ o.label }}</option></sc-for></select>
+      <sc-raw-select class="input" value="{{ cmpB }}" onChange="{{ onCmpB }}" style="width:auto; min-height:34px;"><sc-for list="{{ scanOpts }}" as="o" hint-placeholder-count="4"><option value="{{ o.value }}">{{ o.label }}</option></sc-for></sc-raw-select>
     </div>
   </div>
   <sc-if value="{{ cmp.ruleNote }}" hint-placeholder-val="{{ false }}"><div style="font-size:14px; background:var(--color-accent-100); color:var(--color-accent-900); padding:10px 12px;">Rule sets differ ({{ cmp.a.rules }} → {{ cmp.b.rules }}). Some changes reflect new or re-versioned rules, not org changes.</div></sc-if>
@@ -907,7 +907,7 @@
       <div class="blueprint" style="padding:20px;">
         <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
         <h4 style="margin:0 0 8px;">By severity</h4>
-        <table class="table"><thead><tr><th>Severity</th><th>{{ cmp.a.id }}</th><th>{{ cmp.b.id }}</th><th>Δ</th></tr></thead><tbody><sc-for list="{{ cmp.sevRows }}" as="r" hint-placeholder-count="5"><tr><td><span class="tag" style="background:{{ r.bg }}; color:{{ r.fg }};">{{ r.v }}</span></td><td>{{ r.a }}</td><td>{{ r.b }}</td><td style="color:var(--color-accent-700);">{{ r.d }}</td></tr></sc-for></tbody></table>
+        <sc-raw-table class="table"><sc-raw-thead><sc-raw-tr><sc-raw-th>Severity</sc-raw-th><sc-raw-th>{{ cmp.a.id }}</sc-raw-th><sc-raw-th>{{ cmp.b.id }}</sc-raw-th><sc-raw-th>Δ</sc-raw-th></sc-raw-tr></sc-raw-thead><sc-raw-tbody><sc-for list="{{ cmp.sevRows }}" as="r" hint-placeholder-count="5"><sc-raw-tr><sc-raw-td><span class="tag" style="background:{{ r.bg }}; color:{{ r.fg }};">{{ r.v }}</span></sc-raw-td><sc-raw-td>{{ r.a }}</sc-raw-td><sc-raw-td>{{ r.b }}</sc-raw-td><sc-raw-td style="color:var(--color-accent-700);">{{ r.d }}</sc-raw-td></sc-raw-tr></sc-for></sc-raw-tbody></sc-raw-table>
       </div>
       <div class="blueprint" style="padding:20px;">
         <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
@@ -958,22 +958,22 @@
 <sc-if value="{{ sRules }}" hint-placeholder-val="{{ false }}">
 <section data-screen-label="Rules admin" style="display:flex; flex-direction:column; gap:20px;">
   <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:flex-end; gap:16px;">
-    <div><div style="font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--color-accent-700);">Admin</div><h2 style="margin:4px 0 0;">Rules</h2><div style="font-size:14px; color:var(--color-neutral-700);">Rule set v1.2 · 152 rules · showing {{ ruleTotal }} · {{ enabledCount }} enabled. Changes create a new draft version.</div></div>
+    <div><div style="font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--color-accent-700);">Admin</div><h2 style="margin:4px 0 0;">Rules</h2><div style="font-size:14px; color:var(--color-neutral-700);">Rule set {{ rulesetV }} · {{ ruleCount }} rules · showing {{ ruleTotal }} · {{ enabledCount }} enabled. Changes create a new draft version.</div></div>
     <div style="display:flex; gap:8px; flex-wrap:wrap;">
-      <select class="input" value="{{ ruleCat }}" onChange="{{ onRuleCat }}" style="width:auto; min-height:34px;"><sc-for list="{{ catOpts }}" as="o" hint-placeholder-count="5"><option value="{{ o.value }}">{{ o.label }}</option></sc-for></select>
+      <sc-raw-select class="input" value="{{ ruleCat }}" onChange="{{ onRuleCat }}" style="width:auto; min-height:34px;"><sc-for list="{{ catOpts }}" as="o" hint-placeholder-count="5"><option value="{{ o.value }}">{{ o.label }}</option></sc-for></sc-raw-select>
       <input class="input" value="{{ ruleQ }}" onChange="{{ onRuleQ }}" placeholder="Search rules" style="max-width:220px; min-height:34px;">
     </div>
   </div>
   <div class="blueprint" style="padding:4px 12px 12px; overflow-x:auto;">
     <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
-    <table class="table"><thead><tr><th>Rule</th><th>Name</th><th>Category</th><th>Object</th><th>Severity</th><th>Version</th><th>Enabled</th></tr></thead>
-      <tbody><sc-for list="{{ rules }}" as="r" hint-placeholder-count="10"><tr>
-        <td style="font-family:ui-monospace,monospace; font-size:12px;">{{ r.id }}</td><td style="font-weight:500;">{{ r.name }}</td><td style="font-size:12px; letter-spacing:.06em;">{{ r.cat }}</td><td>{{ r.obj }}</td>
-        <td><select value="{{ r.sev }}" onChange="{{ r.onSev }}" style="border:0; padding:3px 6px; font-size:11px; letter-spacing:.04em; background:{{ r.sevBg }}; color:{{ r.sevFg }};"><sc-for list="{{ sevList }}" as="s" hint-placeholder-count="5"><option value="{{ s.v }}">{{ s.v }}</option></sc-for></select></td>
-        <td style="font-size:12px;">{{ r.ver }}</td>
-        <td><button onClick="{{ r.toggle }}" aria-label="{{ r.state }}" style="all:unset; cursor:pointer; position:relative; display:inline-block; width:36px; height:18px; border:1px solid var(--color-accent); background:{{ r.swBg }};"><span style="position:absolute; top:2px; left:{{ r.kx }}; width:12px; height:12px; background:{{ r.knob }};"></span></button></td>
-      </tr></sc-for></tbody>
-    </table>
+    <sc-raw-table class="table"><sc-raw-thead><sc-raw-tr><sc-raw-th>Rule</sc-raw-th><sc-raw-th>Name</sc-raw-th><sc-raw-th>Category</sc-raw-th><sc-raw-th>Object</sc-raw-th><sc-raw-th>Severity</sc-raw-th><sc-raw-th>Version</sc-raw-th><sc-raw-th>Enabled</sc-raw-th></sc-raw-tr></sc-raw-thead>
+      <sc-raw-tbody><sc-for list="{{ rules }}" as="r" hint-placeholder-count="10"><sc-raw-tr>
+        <sc-raw-td style="font-family:ui-monospace,monospace; font-size:12px;">{{ r.id }}</sc-raw-td><sc-raw-td style="font-weight:500;">{{ r.name }}</sc-raw-td><sc-raw-td style="font-size:12px; letter-spacing:.06em;">{{ r.cat }}</sc-raw-td><sc-raw-td>{{ r.obj }}</sc-raw-td>
+        <sc-raw-td><sc-raw-select value="{{ r.sev }}" onChange="{{ r.onSev }}" style="border:0; padding:3px 6px; font-size:11px; letter-spacing:.04em; background:{{ r.sevBg }}; color:{{ r.sevFg }};"><sc-for list="{{ sevList }}" as="s" hint-placeholder-count="5"><option value="{{ s.v }}">{{ s.v }}</option></sc-for></sc-raw-select></sc-raw-td>
+        <sc-raw-td style="font-size:12px;">{{ r.ver }}</sc-raw-td>
+        <sc-raw-td><button onClick="{{ r.toggle }}" aria-label="{{ r.state }}" style="all:unset; cursor:pointer; position:relative; display:inline-block; width:36px; height:18px; border:1px solid var(--color-accent); background:{{ r.swBg }};"><span style="position:absolute; top:2px; left:{{ r.kx }}; width:12px; height:12px; background:{{ r.knob }};"></span></button></sc-raw-td>
+      </sc-raw-tr></sc-for></sc-raw-tbody>
+    </sc-raw-table>
   </div>
   <div class="blueprint" style="padding:20px;">
     <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
@@ -1004,9 +1004,9 @@
     <div class="blueprint" style="padding:20px; display:flex; flex-direction:column; gap:12px;">
       <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
       <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;"><h4 style="margin:0;">Active sessions</h4><div style="display:flex; gap:8px;"><button class="btn btn-ghost" onClick="{{ settingsA.refresh }}">Refresh</button><button class="btn btn-secondary" onClick="{{ settingsA.signOutOthers }}">Sign out other sessions</button></div></div>
-      <div style="overflow-x:auto;"><table class="table"><thead><tr><th>Device</th><th>IP</th><th>Signed in</th><th>Last active</th><th></th></tr></thead>
-        <tbody><sc-for list="{{ sessRows }}" as="r" hint-placeholder-count="2"><tr><td>{{ r.dev }}</td><td style="font-family:ui-monospace,monospace; font-size:12px;">{{ r.ip }}</td><td>{{ r.created }}</td><td>{{ r.seen }}</td><td><sc-if value="{{ r.current }}" hint-placeholder-val="{{ false }}"><span class="tag tag-accent">This session</span></sc-if></td></tr></sc-for></tbody>
-      </table></div>
+      <div style="overflow-x:auto;"><sc-raw-table class="table"><sc-raw-thead><sc-raw-tr><sc-raw-th>Device</sc-raw-th><sc-raw-th>IP</sc-raw-th><sc-raw-th>Signed in</sc-raw-th><sc-raw-th>Last active</sc-raw-th><sc-raw-th></sc-raw-th></sc-raw-tr></sc-raw-thead>
+        <sc-raw-tbody><sc-for list="{{ sessRows }}" as="r" hint-placeholder-count="2"><sc-raw-tr><sc-raw-td>{{ r.dev }}</sc-raw-td><sc-raw-td style="font-family:ui-monospace,monospace; font-size:12px;">{{ r.ip }}</sc-raw-td><sc-raw-td>{{ r.created }}</sc-raw-td><sc-raw-td>{{ r.seen }}</sc-raw-td><sc-raw-td><sc-if value="{{ r.current }}" hint-placeholder-val="{{ false }}"><span class="tag tag-accent">This session</span></sc-if></sc-raw-td></sc-raw-tr></sc-for></sc-raw-tbody>
+      </sc-raw-table></div>
       <div style="font-size:12px; color:var(--color-neutral-700);">Sessions expire after 8 hours of inactivity and end when the server restarts.</div>
     </div>
   </div>
@@ -1056,16 +1056,16 @@
     <div class="blueprint" style="padding:20px; display:flex; flex-wrap:wrap; justify-content:space-between; align-items:flex-end; gap:16px;">
       <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
       <div style="display:flex; flex-direction:column; gap:10px; min-width:0; flex:1 1 320px;"><div><h4 style="margin:0 0 4px;">Scan retention</h4><div style="font-size:13px; color:var(--color-neutral-700); text-wrap:pretty;">Older snapshots beyond the limit are deleted after each scan and when you save. Compare needs at least 2.</div></div>
-        <select class="input" value="{{ settingsV.keepStr }}" onChange="{{ settingsA.onKeep }}" style="width:auto; max-width:280px;"><sc-for list="{{ keepOpts }}" as="o" hint-placeholder-count="5"><option value="{{ o.v }}">{{ o.l }}</option></sc-for></select></div>
+        <sc-raw-select class="input" value="{{ settingsV.keepStr }}" onChange="{{ settingsA.onKeep }}" style="width:auto; max-width:280px;"><sc-for list="{{ keepOpts }}" as="o" hint-placeholder-count="5"><option value="{{ o.v }}">{{ o.l }}</option></sc-for></sc-raw-select></div>
       <button class="btn btn-primary blueprint" onClick="{{ settingsA.saveData }}"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>Save retention</button>
     </div>
     <div class="blueprint" style="padding:20px;">
       <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
       <h4 style="margin:0 0 4px;">Stored data by connection</h4>
       <div style="font-size:13px; color:var(--color-neutral-700); margin-bottom:8px;">Exports contain scan snapshots and triage — never credentials.</div>
-      <div style="overflow-x:auto;"><table class="table"><thead><tr><th>Connection</th><th>Scans</th><th>Last scan</th><th style="text-align:right;">Actions</th></tr></thead>
-        <tbody><sc-for list="{{ dataConns }}" as="c" hint-placeholder-count="3"><tr><td style="font-weight:500;">{{ c.name }}</td><td>{{ c.scans }}</td><td>{{ c.last }}</td><td><div style="display:flex; gap:8px; justify-content:flex-end;"><button class="btn btn-secondary" onClick="{{ c.exp }}">Export JSON</button><button class="btn btn-ghost" onClick="{{ c.clear }}">Delete history</button></div></td></tr></sc-for></tbody>
-      </table></div>
+      <div style="overflow-x:auto;"><sc-raw-table class="table"><sc-raw-thead><sc-raw-tr><sc-raw-th>Connection</sc-raw-th><sc-raw-th>Scans</sc-raw-th><sc-raw-th>Last scan</sc-raw-th><sc-raw-th style="text-align:right;">Actions</sc-raw-th></sc-raw-tr></sc-raw-thead>
+        <sc-raw-tbody><sc-for list="{{ dataConns }}" as="c" hint-placeholder-count="3"><sc-raw-tr><sc-raw-td style="font-weight:500;">{{ c.name }}</sc-raw-td><sc-raw-td>{{ c.scans }}</sc-raw-td><sc-raw-td>{{ c.last }}</sc-raw-td><sc-raw-td><div style="display:flex; gap:8px; justify-content:flex-end;"><button class="btn btn-secondary" onClick="{{ c.exp }}">Export JSON</button><button class="btn btn-ghost" onClick="{{ c.clear }}">Delete history</button></div></sc-raw-td></sc-raw-tr></sc-for></sc-raw-tbody>
+      </sc-raw-table></div>
     </div>
   </div>
   </sc-if>
@@ -1261,7 +1261,7 @@ class Component extends DCLogic {
     try { const r = await fetch('/api/health', { credentials: 'same-origin' }); if (r.ok && /json/.test(r.headers.get('content-type') || '')) h = await r.json(); } catch (e) { }
     if (!h || !h.ok) { this.index(); this.setState({ screen: (this.props && this.props.startScreen) || 'login' }); return; }
     this.D = this.emptyD(); this.index();
-    this.setState({ live: true, firstRun: !!h.firstRun, email: '', pw: '', conns: [], orgId: '', connSel: '', fid: '', aid: '', depAsset: '', buSel: '', hSel: [], cmpA: '', cmpB: '', dSel: '' });
+    this.setState({ live: true, ruleset: h.ruleset || '', firstRun: !!h.firstRun, email: '', pw: '', conns: [], orgId: '', connSel: '', fid: '', aid: '', depAsset: '', buSel: '', hSel: [], cmpA: '', cmpB: '', dSel: '' });
     const se = await this.api('GET', '/api/session').catch(() => ({}));
     if (se.user) { this.setMe(se.user); await this.boot(); } else this.setState({ screen: 'login' });
   }
@@ -1544,6 +1544,9 @@ ${o.disclaimer ? `<p><small>${e(o.disclaimer)}</small></p>` : ''}<p><small>Read-
     const viewIdx = live && s.viewScan ? Math.max(0, scans.findIndex(x => x.id === s.viewScan)) : scans.length - 1;
     const latest = scans[viewIdx] || this.EMPTY_SCAN;
     const prev = scans[viewIdx - 1] || latest;
+    const rulesetV = live ? (s.ruleset ? 'v' + s.ruleset : '—') : 'v1.2';   // demo data was produced by rule set v1.2
+    const ruleCat = this.rulesCat || D.rules || [];
+    const ruleV = (id) => { const r = ruleCat.find(x => x[0] === id); return r && r[5] ? 'v' + r[5] : ''; };
     const ctx = { scan: latest.id, date: latest.date, bus: live ? (D.bus.length || org.bus) : org.bus, rules: latest.rules, coverage: latest.cov };
     if (!live && s.orgId !== 'acme-prod') { ctx.scan = org.scan; ctx.date = org.last; ctx.coverage = org.coverage; }
 
@@ -1567,7 +1570,7 @@ ${o.disclaimer ? `<p><small>${e(o.disclaimer)}</small></p>` : ''}<p><small>Read-
     const F = D.findings.map(f => { const x = s.fx[f.id] || {}; const c = this.sevCss(f.sev);
       return { ...f, status: x.status || f.status, owner: x.owner || 'Unassigned', notes: x.notes || [], inReport: x.inReport !== undefined ? x.inReport : (f.sev === 'CRITICAL' || f.sev === 'HIGH'), sevBg: c.bg, sevFg: c.fg,
         open: () => this.go('finding', { fid: f.id, noteDraft: '' }), select: () => this.setState({ fid: f.id }), selBg: f.id === s.fid ? 'var(--color-accent-100)' : 'transparent',
-        evidenceRows: (f.evidence || []).map(([k, v]) => ({ k, v })), hasLimit: f.limit && f.limit !== 'None',
+        evidenceRows: (f.evidence || []).map(([k, v]) => ({ k, v })), hasLimit: f.limit && f.limit !== 'None', ruleV: ruleV(f.rule),
         hasCode: !!(f.code && f.code.length), codeBlocks: (f.code || []).map(cb => ({ title: cb.where + ' · line ' + cb.line + (cb.col ? ', col ' + cb.col : ''),
           rows: (cb.lines || []).map(([n, t, hit]) => ({ n: String(n), t: t || ' ', bg: hit ? 'var(--color-accent-100)' : 'transparent', fg: hit ? 'var(--color-accent-900)' : 'var(--color-neutral-800)', weight: hit ? '600' : '400' })) })) };
     });
@@ -1579,7 +1582,7 @@ ${o.disclaimer ? `<p><small>${e(o.disclaimer)}</small></p>` : ''}<p><small>Read-
     const totals = {}; D.sevs.forEach((v, i) => { totals[v] = live ? F.filter(f => f.sev === v).length : latest.sev[i]; });
     const sevChips = D.sevs.map(v => { const on = !!s.sevOn[v]; const c = this.sevCss(v); return { label: v, n: base.filter(f => f.sev === v).length, total: totals[v], bg: on ? c.bg : 'transparent', fg: on ? c.fg : 'var(--color-text)', bd: on ? c.bg : 'var(--color-divider)', toggle: () => this.setState(st => ({ sevOn: { ...st.sevOn, [v]: !st.sevOn[v] } })) }; });
     const fGroups = D.sevs.map(v => ({ sev: v, items: fList.filter(f => f.sev === v) })).filter(g => g.items.length).map(g => ({ ...g, n: g.items.length, bg: this.sevCss(g.sev).bg, fg: this.sevCss(g.sev).fg }));
-    const fdRaw = F.find(f => f.id === s.fid) || F[0] || { ...this.EMPTY_F, owner: 'Unassigned', notes: [], inReport: false, evidenceRows: [], hasCode: false, codeBlocks: [], sevBg: this.sevCss('INFO').bg, sevFg: this.sevCss('INFO').fg, open: () => {}, select: () => {}, selBg: 'transparent', hasLimit: false };
+    const fdRaw = F.find(f => f.id === s.fid) || F[0] || { ...this.EMPTY_F, owner: 'Unassigned', notes: [], inReport: false, evidenceRows: [], hasCode: false, codeBlocks: [], ruleV: '', sevBg: this.sevCss('INFO').bg, sevFg: this.sevCss('INFO').fg, open: () => {}, select: () => {}, selBg: 'transparent', hasLimit: false };
     const setFx = (patch) => { if (fdRaw.id !== '—') setFxFor(fdRaw.id, patch); };
     const fd = { ...fdRaw, isAck: fdRaw.status !== 'OPEN', hasNotes: fdRaw.notes.length > 0, noteRows: fdRaw.notes.map(n => ({ t: n })), hasChain: !!(fdRaw.chain && fdRaw.chain.length), chainRows: (fdRaw.chain || []).filter(Boolean).map((c, i, arr) => ({ name: c, notLast: i < arr.length - 1 })),
       reportLabel: fdRaw.inReport ? 'In report ✓' : 'Add to report', ackLabel: fdRaw.status === 'OPEN' ? 'Acknowledge' : 'Reopen' };
@@ -1853,7 +1856,7 @@ ${o.disclaimer ? `<p><small>${e(o.disclaimer)}</small></p>` : ''}<p><small>Read-
       aria: 'Scan running — open progress', open: () => this.go('progress'),
     };
     return {
-      scanBadge,
+      scanBadge, rulesetV, ruleCount: ruleCat.length,
       isLogin: scr === 'login', isApp: scr !== 'login' && scr !== 'boot', isBoot: scr === 'boot',
       isDemo: !live, isLive: live, appMode: live ? 'Read-only · live · v' + '1.0' : 'Demo data · server offline', pwHint: live ? (s.firstRun ? 'First sign-in: choose an owner password (8+)' : '') : 'Any 6+ characters',
       showNoData: live && !hasScan && dataScreens.includes(scr), noOrg: live && !conns.length, busy: s.busy, isBusy: !!s.busy, loadErr: s.loadErr, hasLoadErr: !!s.loadErr, me: s.me, dash,
@@ -1881,7 +1884,7 @@ ${o.disclaimer ? `<p><small>${e(o.disclaimer)}</small></p>` : ''}<p><small>Read-
       dashVariants, isDashA: s.dashV === 'a', isDashB: s.dashV === 'b', isDashC: s.dashV === 'c', latest, sevCounts, domains, topRisks, quickWins, inventory, histBars, limits, archNotes, healthDelta: sd(latest.health - prev.health), prevId: prev.id, corr, corrChain,
       bus, buRoot, buChildren, buSelD, buActions,
       aTypes, aList, asset, aTabs, aQ: s.aQ, onAQ: this.val('aQ'), aType: s.aType, isTabOverview: s.aTab === 'Overview', isTabConfig: s.aTab === 'Configuration', isTabDeps: s.aTab === 'Dependencies', isTabFindings: s.aTab === 'Findings', isTabHistory: s.aTab === 'History', openAssetDeps: () => this.go('deps', { depAsset: aRaw.key || aRaw.name, depSel: null }), aEmpty: aList.length === 0, aMore: aAll.length > aList.length, aMoreLabel: 'Showing ' + aList.length + ' of ' + this.fmt(aAll.length) + ' — refine the search',
-      findVariants, isFindA: s.findV === 'a', isFindB: s.findV === 'b', sevChips, fList, fGroups, fCount: fAll.length, fEmpty: fList.length === 0, fSel, fQ: s.fQ, onFQ: this.val('fQ'), fMore: fAll.length > fList.length, fMoreLabel: 'Showing ' + fList.length + ' of ' + this.fmt(fAll.length) + ' — filter to narrow down',
+      findVariants, isFindA: s.findV === 'a', isFindB: s.findV === 'b', sevChips, fList, fGroups, fCount: fAll.length, fSummary: live ? fAll.length + ' shown · ' + D.findings.length + ' in scan' : fAll.length + ' shown from the sample · ' + (latest.sev || []).reduce((t, x) => t + x, 0) + ' total in scan', fEmpty: fList.length === 0, fSel, fQ: s.fQ, onFQ: this.val('fQ'), fMore: fAll.length > fList.length, fMoreLabel: 'Showing ' + fList.length + ' of ' + this.fmt(fAll.length) + ' — filter to narrow down',
       fDomain: s.fDomain, fBu: s.fBu, fStatus: s.fStatus, onFDomain: this.val('fDomain'), onFBu: this.val('fBu'), onFStatus: this.val('fStatus'),
       domainOpts: ['All', ...new Set(D.findings.map(f => f.domain))].map(v => ({ v, l: v === 'All' ? 'All domains' : v })), buOpts: ['All', ...D.bus.map(b => b.short)].map(v => ({ v, l: v === 'All' ? 'All BUs' : v })), statusOpts: [['All', 'Any status'], ['OPEN', 'Open'], ['ACKNOWLEDGED', 'Acknowledged']].map(([v, l]) => ({ v, l })),
       clearFilters: () => this.setState({ sevOn: {}, fDomain: 'All', fBu: 'All', fStatus: 'All', fQ: '' }),

@@ -32,6 +32,7 @@ MCNexus is a read-only assessment tool for Salesforce Marketing Cloud Engagement
    - Template holes are dotted lookups only (`{{ a.b }}`); compute everything in `renderVals()`.
    - Always close tags.
    - Always set `hint-*` on `sc-if` / `sc-for`.
+   - In the template, write table and select tags as the runtime aliases: `sc-raw-table`, `sc-raw-thead`, `sc-raw-tbody`, `sc-raw-tr`, `sc-raw-th`, `sc-raw-td`, `sc-raw-select`. They render as the real tags. A plain `<tbody>`/`<select>` around `sc-for` gets re-nested by the browser when the app is opened as a file (demo mode), leaving the table or list empty.
 5. **Demo fallback must keep working.** If `/api/health` isn't reachable, the UI runs on the embedded `DEMO` dataset with a banner. Every new UI value needs both a `live` path and a demo path.
 6. **Finding IDs are stable:** `F-` + sha1(rule|objKey)[0:6]. Don't change the scheme; triage and scan-compare depend on it.
 7. **Domain order is fixed** (`DOMAINS` in `server/analyze.js`). Scan `dom[]` arrays are aligned to it. Append new domains only at the end.
