@@ -174,6 +174,25 @@ function sfmcOrg(over = {}) {
   };
 }
 
+// ---------- PostgreSQL backends for store tests ----------
+// PGlite (in-process Postgres, devDependency) — returns null when it isn't installed so suites can skip.
+async function pgliteAdapter() {
+  let PGlite; try { ({ PGlite } = require('@electric-sql/pglite')); } catch { return null; }
+  const { splitSql } = require('../server/store-pg');
+  const pg = new PGlite(); await pg.waitReady;
+  return {
+    query: async (t, p) => (await pg.query(t, p)).rows,
+    tx: (list) => pg.transaction(async (tx) => { const out = []; for (const [t, p] of list) out.push((await tx.query(t, p)).rows); return out; }),
+    exec: (script) => pg.transaction(async (tx) => { for (const s of splitSql(script)) await tx.query(s); }),
+    close: () => pg.close(),
+  };
+}
+const SCHEMA = () => fs.readFileSync(path.join(__dirname, '..', 'server', 'schema.sql'), 'utf8');
+const PG_TABLES = ['password_reset', 'invite', 'app_session', 'triage', 'scan_snapshot', 'scan', 'connection', 'app_setting', 'app_user'];
+// Every persisted row as text — used to prove secrets never land in storage in plaintext.
+const pgDump = async (adapter) => { let out = ''; for (const t of PG_TABLES) out += t + ':' + JSON.stringify(await adapter.query(`SELECT * FROM ${t}`, [])) + '\n'; return out; };
+const jsonDump = (dir) => { let out = ''; const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).forEach(e => { const f = path.join(d, e.name); if (e.isDirectory()) walk(f); else out += fs.readFileSync(f, 'utf8') + '\n'; }); walk(dir); return out; };
+
 const newJob = () => ({ connId: 'c-test', scanId: '#001', n: 1, t0: Date.now(), pct: 0, cur: 'Starting', log: [], mods: {}, counts: { assets: 0, rels: 0, rules: 0, findings: 0, warnings: 0, errors: 0 }, done: false, error: null, cancelled: false });
 
 // Starts the request handler on an ephemeral port. `call` keeps the session cookie between requests.
@@ -191,4 +210,4 @@ async function startApp(handle) {
   return { base, call, raw, setCookie: (c) => { cookie = c; }, close: () => { s.closeAllConnections && s.closeAllConnections(); return new Promise(r => s.close(r)); } };
 }
 
-module.exports = { SUB, CID, SEC, RECENT, OLD, loadServer, fakeSfmc, assertReadOnly, sfmcOrg, newJob, startApp };
+module.exports = { SUB, CID, SEC, RECENT, OLD, loadServer, fakeSfmc, assertReadOnly, sfmcOrg, newJob, startApp, pgliteAdapter, SCHEMA, PG_TABLES, pgDump, jsonDump };

@@ -2,11 +2,19 @@
   "name": "mcnexus",
   "version": "1.0.0",
   "private": true,
-  "description": "Read-only SFMC org assessment — UI + zero-dependency Node server",
-  "engines": { "node": ">=18" },
+  "description": "Read-only SFMC org assessment — UI + Node server (JSON files or PostgreSQL)",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "start": "node server/mcnexus-server.js",
     "check": "node --check server/mcnexus-server.js",
     "test": "node --test"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "1.1.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.8"
   }
 }

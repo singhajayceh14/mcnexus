@@ -1,53 +1,122 @@
--- MCNexus — PostgreSQL schema (v1)
--- Target: PostgreSQL 14+. Mirrors the current file store (store.json + scans/<conn>/<n>.json)
--- so the server can move to Postgres without changing the UI data contract.
+-- MCNexus — PostgreSQL schema, version 1. Target: PostgreSQL 14+ (Neon in production, PGlite in tests).
 --
--- Mapping from today's store:
---   db.users            -> app_user
---   sessions (memory)   -> app_session
---   db.settings         -> app_setting (one row per section, JSONB)
---   db.connections      -> connection, connection_bu, connection_access
---   db.scans[cid][]     -> scan            (summary row)
---   scans/<cid>/<n>.json-> scan_snapshot   (full dataset, JSONB) + normalized tables below
---   ds.findings         -> finding
---   ds.assets           -> asset, asset_edge, graph_node
---   db.triage[cid]      -> triage, triage_note
+-- Applied by `npm run db:schema` (server/migrate-json-to-pg.js --schema). Idempotent: every statement can be
+-- re-run. Statements end with ';' at the end of a line and contain no other ';' — the Neon HTTP driver runs
+-- them one at a time inside a single transaction, so no plpgsql bodies, no extensions, no enums.
+--
+-- Mapping from the JSON store (server/data):
+--   store.json users[]              -> app_user
+--   store.json settings.<section>   -> app_setting (one row per section)
+--   store.json connections[]        -> connection
+--   store.json scans[cid][]         -> scan (summary)
+--   scans/<cid>/<n>.json            -> scan_snapshot (full dataset, json — kept byte-for-byte, never queried)
+--   store.json triage[cid][fid]     -> triage
+--   (in memory today)               -> app_session; invite and password_reset are for user management
 --
 -- Hard rules carried over from CLAUDE.md:
---   * Client secrets are stored ONLY as AES-256-GCM ciphertext (secret_enc). Key stays outside the DB.
---   * Finding IDs are stable: 'F-' + sha1(rule|objKey)[0:6]. Triage is keyed on (connection, finding_id),
---     not on scan, so it survives rescans.
---   * Domain order is fixed; domain.ord is the index into scan.dom[]. Append only.
+--   * Client secrets are stored ONLY as AES-256-GCM ciphertext (connection.secret_enc). The key (MCNEXUS_KEY)
+--     never goes into the database.
+--   * Finding IDs are stable ('F-' + sha1(rule|objKey)[0:6]); triage is keyed on (connection, finding_id), not on
+--     scan, so it survives rescans.
+--   * Domain order is fixed; scan summaries keep dom[] aligned to it inside summary jsonb.
 
-BEGIN;
-
-CREATE EXTENSION IF NOT EXISTS pgcrypto;  -- gen_random_uuid()
-
--- ---------- enums ----------
-CREATE TYPE user_role      AS ENUM ('Owner', 'Admin', 'Consultant', 'Viewer');
-CREATE TYPE conn_env       AS ENUM ('Production', 'Sandbox', 'Development');
-CREATE TYPE conn_status    AS ENUM ('Connected', 'Limited', 'Failed', 'Expired');
-CREATE TYPE severity       AS ENUM ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO');
-CREATE TYPE scan_mode      AS ENUM ('Quick', 'Full', 'Custom');
-CREATE TYPE scan_state     AS ENUM ('RUNNING', 'SUCCESS', 'PARTIAL', 'FAILED');
-CREATE TYPE triage_status  AS ENUM ('Open', 'In review', 'Accepted', 'Resolved', 'False positive');
-CREATE TYPE asset_kind     AS ENUM ('DE', 'SQL', 'AUTO', 'IMP', 'SCR', 'JRN', 'CNT');   -- real assets
-CREATE TYPE vnode_kind     AS ENUM ('DV', 'EML', 'USR', 'NAM');                          -- virtual graph nodes
-
--- ---------- updated_at helper ----------
-CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN NEW.updated_at := now(); RETURN NEW; END $$;
-
--- ---------- identity ----------
-CREATE TABLE app_user (
-  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  email         citext_placeholder,  -- replaced below if citext is unavailable
-  name          text        NOT NULL,
-  role          user_role   NOT NULL DEFAULT 'Consultant',
-  pw_salt       text        NOT NULL,             -- hex, 16 bytes
-  pw_hash       text        NOT NULL,             -- hex, scrypt/pbkdf2 output (see hashPw)
-  disabled      boolean     NOT NULL DEFAULT false,
-  created_at    timestamptz NOT NULL DEFAULT now(),
-  updated_at    timestamptz NOT NULL DEFAULT now()
+CREATE TABLE IF NOT EXISTS schema_version (
+  version     integer     PRIMARY KEY,
+  applied_at  timestamptz NOT NULL DEFAULT now()
 );
-COMMIT;
+
+CREATE TABLE IF NOT EXISTS app_user (
+  id          uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+  email       text        NOT NULL UNIQUE CHECK (email = lower(email)),
+  name        text        NOT NULL,
+  role        text        NOT NULL DEFAULT 'Consultant' CHECK (role IN ('Owner', 'Admin', 'Consultant', 'Viewer')),
+  pw_salt     text        NOT NULL,
+  pw_hash     text        NOT NULL,
+  disabled    boolean     NOT NULL DEFAULT false,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS app_setting (
+  section     text        PRIMARY KEY CHECK (section IN ('rulesX', 'naming', 'scan', 'report', 'data')),
+  value       jsonb,
+  updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS connection (
+  id              text        PRIMARY KEY,
+  name            text        NOT NULL,
+  env             text        NOT NULL DEFAULT 'Production',
+  sub             text        NOT NULL,
+  client_id       text        NOT NULL,
+  mid             text        NOT NULL DEFAULT '',
+  secret_enc      text        NOT NULL,
+  secret_updated  timestamptz,
+  status          text        NOT NULL DEFAULT 'Connected',
+  validated       text,
+  bu_list         jsonb       NOT NULL DEFAULT '[]',
+  bu_off          jsonb       NOT NULL DEFAULT '{}',
+  access          jsonb       NOT NULL DEFAULT '[]',
+  scopes          jsonb       NOT NULL DEFAULT '[]',
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  updated_at      timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS scan (
+  conn_id     text        NOT NULL REFERENCES connection (id) ON DELETE CASCADE,
+  n           integer     NOT NULL,
+  scan_id     text        NOT NULL,
+  summary     jsonb       NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (conn_id, n)
+);
+
+CREATE TABLE IF NOT EXISTS scan_snapshot (
+  conn_id     text        NOT NULL,
+  n           integer     NOT NULL,
+  data        json        NOT NULL,
+  PRIMARY KEY (conn_id, n),
+  FOREIGN KEY (conn_id, n) REFERENCES scan (conn_id, n) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS triage (
+  conn_id     text        NOT NULL REFERENCES connection (id) ON DELETE CASCADE,
+  finding_id  text        NOT NULL,
+  data        jsonb       NOT NULL,
+  updated_by  text,
+  updated_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (conn_id, finding_id)
+);
+
+-- Sessions are looked up by sha256(token); the raw token only ever lives in the browser cookie.
+CREATE TABLE IF NOT EXISTS app_session (
+  token_hash  text        PRIMARY KEY,
+  user_id     uuid        NOT NULL REFERENCES app_user (id) ON DELETE CASCADE,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  last_seen   timestamptz NOT NULL DEFAULT now(),
+  expires_at  timestamptz NOT NULL,
+  user_agent  text,
+  ip          text
+);
+CREATE INDEX IF NOT EXISTS app_session_user_idx ON app_session (user_id);
+CREATE INDEX IF NOT EXISTS app_session_expires_idx ON app_session (expires_at);
+
+CREATE TABLE IF NOT EXISTS invite (
+  token_hash  text        PRIMARY KEY,
+  email       text        NOT NULL CHECK (email = lower(email)),
+  role        text        NOT NULL CHECK (role IN ('Admin', 'Consultant', 'Viewer')),
+  invited_by  uuid        REFERENCES app_user (id) ON DELETE SET NULL,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  expires_at  timestamptz NOT NULL,
+  used_at     timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS password_reset (
+  token_hash  text        PRIMARY KEY,
+  user_id     uuid        NOT NULL REFERENCES app_user (id) ON DELETE CASCADE,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  expires_at  timestamptz NOT NULL,
+  used_at     timestamptz
+);
+
+INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING;
