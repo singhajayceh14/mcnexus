@@ -4,7 +4,7 @@
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto'), zlib = require('zlib');
 const { Worker } = require('worker_threads');
 const { createStore } = require('./store');
-const { RULESET, arr, dig, fmtD, ageDays, hid, plural, bool, RULES, RULE, DOMAIN_OF, DOMAINS, MODULES, SEVS, W, PEN, score, AUTO_STATUS, ACT_TYPE, CONTENT_TYPES, PAGE_TYPES, SECRET_RE, sqlSources, sqlDepth, patternRe, analyze, emptyM, mergeM, packPart, unpackPart, hasData, analyzeParts } = require('./analyze');
+const { assetCode, RULESET, arr, dig, fmtD, ageDays, hid, plural, bool, RULES, RULE, DOMAIN_OF, DOMAINS, MODULES, SEVS, W, PEN, score, AUTO_STATUS, ACT_TYPE, CONTENT_TYPES, PAGE_TYPES, SECRET_RE, sqlSources, sqlDepth, patternRe, analyze, emptyM, mergeM, packPart, unpackPart, hasData, analyzeParts } = require('./analyze');
 
 const PORT = +process.env.PORT || 8787, HOST = process.env.HOST || '127.0.0.1';
 const ROOT = path.resolve(__dirname, '..'), DATA = process.env.MCNEXUS_DATA || path.join(__dirname, 'data');
@@ -369,8 +369,8 @@ const STEPS = {
         const items = j.items || []; c.total = j.count != null ? j.count : c.total; c.got += items.length; st.counts.assets += items.length;
         items.forEach(a => {
           const tn = dig(a, 'assetType', 'name') || '';
-          let text = (a.content || '') + '\n' + (a.views ? JSON.stringify(a.views) : ''); if (text.length > 300000) text = text.slice(0, 300000);
-          M.content.push(tag({ id: String(a.id), ck: a.customerKey, name: a.name, typeName: tn, isPage: PAGE_TYPES.includes(tn), folder: dig(a, 'category', 'name'), modified: a.modifiedDate, created: a.createdDate, legacyId: dig(a, 'legacyData', 'legacyId'), status: dig(a, 'status', 'name'), text }));
+          const code = assetCode(a);   // raw code by segment (not JSON-escaped), so findings can point at a line
+          M.content.push(tag({ id: String(a.id), ck: a.customerKey, name: a.name, typeName: tn, isPage: PAGE_TYPES.includes(tn), folder: dig(a, 'category', 'name'), modified: a.modifiedDate, created: a.createdDate, legacyId: dig(a, 'legacyData', 'legacyId'), status: dig(a, 'status', 'name'), text: code.text, segs: code.segs }));
         });
         if (!items.length || (c.total != null ? c.got >= c.total : items.length < 200)) { end = true; break; }
       }

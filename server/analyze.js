@@ -54,6 +54,45 @@ const DE_INIT_RE = /DataExtension\.Init\s*\(\s*\\?["']([^"'\\]+)\\?["']/gi;
 const CB_ID_RE = /ContentBlockBy(?:Id|ID)\s*\(\s*\\?["']?(\d+)/g;
 const CB_KEY_RE = /ContentBlockByKey\s*\(\s*\\?["']([^"'\\]+)\\?["']/gi;
 
+// ---------- code locations (CloudPages, content, script activities) ----------
+// Asset code is kept as labelled segments — the asset's own content plus every content / superContent string under
+// views (views.html, slots, blocks) — joined into one text for the reference and secret scans. segs records where
+// each segment starts in that text, so a match index maps back to segment, line and column.
+const CODE_MAX = 300000, LINE_MAX = 200;
+function assetCode(a) {
+  const parts = [], add = (label, s) => { if (typeof s === 'string' && s.trim()) parts.push([label, s]); };
+  add('content', a.content);
+  const walk = (o, p, d) => { if (!o || typeof o !== 'object' || d > 8) return; for (const [k, v] of Object.entries(o)) { if ((k === 'content' || k === 'superContent') && typeof v === 'string') add(k === 'content' ? p : p + '.superContent', v); else walk(v, p + '.' + k, d + 1); } };
+  walk(a.views, 'views', 0);
+  let text = ''; const segs = [];
+  for (const [label, s] of parts) { if (text.length >= CODE_MAX) break; if (text) text += '\n'; segs.push([label, text.length]); text += s; }
+  return { text: text.slice(0, CODE_MAX), segs };
+}
+// Segment, 1-based line and column of an index into the joined text, plus the segment's bounds.
+function locate(text, segs, idx, fallback = 'code') {
+  const list = segs && segs.length ? segs : [[fallback, 0]]; let where = list[0][0], start = 0, end = text.length;
+  list.forEach(([label, s], i) => { if (s <= idx) { where = label; start = s; end = i + 1 < list.length ? list[i + 1][1] - 1 : text.length; } });
+  const before = text.slice(start, idx);
+  return { where, line: before.split('\n').length, col: idx - start - before.lastIndexOf('\n'), start, end };
+}
+const mask = (v) => v.slice(0, 2) + '••••••' + v.slice(-2);
+const SECRET_G = () => new RegExp(SECRET_RE.source, 'gi');
+const maskSecrets = (s) => s.replace(SECRET_G(), (m, name, val) => { const i = m.lastIndexOf(val); return m.slice(0, i) + mask(val) + m.slice(i + val.length); });
+// Lines around a location, credential values masked (on the full line, before long lines are trimmed).
+function excerpt(text, loc, ctx = 2) {
+  const lines = text.slice(loc.start, loc.end).split('\n'), from = Math.max(1, loc.line - ctx), to = Math.min(lines.length, loc.line + ctx);
+  const clip = (s, hit) => { if (s.length <= LINE_MAX) return s; const a = hit ? Math.max(0, loc.col - 1 - 60) : 0; return (a ? '… ' : '') + s.slice(a, a + LINE_MAX) + (a + LINE_MAX < s.length ? ' …' : ''); };
+  const rows = []; for (let n = from; n <= to; n++) rows.push([n, clip(maskSecrets(lines[n - 1].replace(/\r$/, '').replace(/\t/g, '  ')), n === loc.line), n === loc.line]);
+  return { where: loc.where, line: loc.line, col: loc.col, lines: rows };
+}
+const at = (l) => l.where + ' · line ' + l.line + ', col ' + l.col;
+// Every credential-like literal (first 5 located), with a total count.
+function secretHits(text, segs, fallback) {
+  const re = SECRET_G(), hits = []; let m, total = 0;
+  while ((m = re.exec(text))) { total++; if (hits.length < 5) hits.push({ name: m[1], masked: mask(m[2]), ...locate(text, segs, m.index, fallback) }); }
+  return { hits, total };
+}
+
 function sqlSources(text) {
   const t = String(text || '').replace(/--.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
   const re = /\b(?:from|join)\s+(\[[^\]]+\]|"[^"]+"|[A-Za-z0-9_.\-]+)/gi; const out = new Set(); let m;
@@ -123,7 +162,7 @@ function analyze(M, o) {
   const finding = (rule, a, x) => {
     const r = RULE[rule]; if (!r) return; const ov = rx[rule] || {}; if (ov.enabled === false) return;
     const sev = ov.sev || x.sev || r[4];
-    F.push({ id: 'F-' + hid(rule + '|' + (x.objKey || a.key)), rule, sev, domain: DOMAIN_OF[r[2]], bu: x.bu || (a.raw && a.raw.bu) || '—', objType: x.objType || a.type, obj: x.obj || a.name, objKey: x.objKey || a.key, title: x.title || r[1], impact: x.impact || (sev === 'CRITICAL' || sev === 'HIGH' ? 'HIGH' : sev === 'MEDIUM' ? 'MEDIUM' : 'LOW'), like: x.like || 'MEDIUM', conf: x.conf || 'HIGH', effort: x.effort || 'LOW', status: 'OPEN', why: x.why, evidence: x.evidence || [], affected: x.affected || '', rec: x.rec, limit: x.limit || 'None', chain: x.chain });
+    F.push({ id: 'F-' + hid(rule + '|' + (x.objKey || a.key)), rule, sev, domain: DOMAIN_OF[r[2]], bu: x.bu || (a.raw && a.raw.bu) || '—', objType: x.objType || a.type, obj: x.obj || a.name, objKey: x.objKey || a.key, title: x.title || r[1], impact: x.impact || (sev === 'CRITICAL' || sev === 'HIGH' ? 'HIGH' : sev === 'MEDIUM' ? 'MEDIUM' : 'LOW'), like: x.like || 'MEDIUM', conf: x.conf || 'HIGH', effort: x.effort || 'LOW', status: 'OPEN', why: x.why, evidence: x.evidence || [], affected: x.affected || '', rec: x.rec, limit: x.limit || 'None', chain: x.chain, code: x.code });
   };
 
   // edges: SQL
@@ -142,13 +181,13 @@ function analyze(M, o) {
     if (tgt) link(a.key, tgt.key, 'CONTAINS');
   }));
   const deRefs = (text, mid, key, list) => { let m; const seen = new Set();
-    DE_FN_RE.lastIndex = 0; while ((m = DE_FN_RE.exec(text))) { const n = m[1]; if (seen.has(n.toLowerCase())) continue; seen.add(n.toLowerCase()); const d = findDe(mid, n); if (d) link(d.key, key, 'REFERENCES'); else list.push(n); }
-    DE_INIT_RE.lastIndex = 0; while ((m = DE_INIT_RE.exec(text))) { const n = m[1]; if (seen.has(n.toLowerCase())) continue; seen.add(n.toLowerCase()); const d = deByCk[mid + '|' + n.toLowerCase()] || findDe(mid, n); if (d) link(d.key, key, 'REFERENCES'); else list.push(n); } };
+    DE_FN_RE.lastIndex = 0; while ((m = DE_FN_RE.exec(text))) { const n = m[1]; if (seen.has(n.toLowerCase())) continue; seen.add(n.toLowerCase()); const d = findDe(mid, n); if (d) link(d.key, key, 'REFERENCES'); else list.push({ n, i: m.index }); }
+    DE_INIT_RE.lastIndex = 0; while ((m = DE_INIT_RE.exec(text))) { const n = m[1]; if (seen.has(n.toLowerCase())) continue; seen.add(n.toLowerCase()); const d = deByCk[mid + '|' + n.toLowerCase()] || findDe(mid, n); if (d) link(d.key, key, 'REFERENCES'); else list.push({ n, i: m.index }); } };
   M.scripts.forEach(s => { s.missing = []; deRefs(s.text, s.mid, s.key, s.missing); });
   M.content.forEach(c => {
     c.missing = []; c.brokenCb = []; deRefs(c.text, c.mid, c.key, c.missing); let m;
-    CB_ID_RE.lastIndex = 0; while ((m = CB_ID_RE.exec(c.text))) { const b = cById[c.mid + '|' + m[1]] || cByIdAny[m[1]]; if (b) link(b.key, c.key, 'EMBEDDED_IN'); else if (!c.brokenCb.includes(m[1])) c.brokenCb.push(m[1]); }
-    CB_KEY_RE.lastIndex = 0; while ((m = CB_KEY_RE.exec(c.text))) { const b = cByCk[c.mid + '|' + m[1].toLowerCase()]; if (b) link(b.key, c.key, 'EMBEDDED_IN'); else if (!c.brokenCb.includes(m[1])) c.brokenCb.push(m[1]); }
+    CB_ID_RE.lastIndex = 0; while ((m = CB_ID_RE.exec(c.text))) { const b = cById[c.mid + '|' + m[1]] || cByIdAny[m[1]]; if (b) link(b.key, c.key, 'EMBEDDED_IN'); else if (!c.brokenCb.some(x => x.n === m[1])) c.brokenCb.push({ n: m[1], i: m.index }); }
+    CB_KEY_RE.lastIndex = 0; while ((m = CB_KEY_RE.exec(c.text))) { const b = cByCk[c.mid + '|' + m[1].toLowerCase()]; if (b) link(b.key, c.key, 'EMBEDDED_IN'); else if (!c.brokenCb.some(x => x.n === m[1])) c.brokenCb.push({ n: m[1], i: m.index }); }
   });
   M.journeys.forEach(j => {
     const ev = j.evKey && evByKey[j.mid + '|' + j.evKey];
@@ -198,12 +237,14 @@ function analyze(M, o) {
     const stale = j.versions.filter(v => v.v !== j.version && /stopped|draft|unpublished/i.test(v.status || '') && ageDays(v.modified) > 180);
     if (stale.length >= 3) finding('JRN-VER-002', a, { why: stale.length + ' old versions are stopped or draft and unmodified for 180+ days.', evidence: [['Versions', String(j.versions.length)], ['Stale', String(stale.length)]], rec: 'Review and retire unused versions.' });
   });
-  const secretHit = (text) => { const m = String(text || '').match(SECRET_RE); if (!m) return null; const line = String(text).slice(0, m.index).split('\n').length; return { name: m[1], line, masked: m[2].slice(0, 2) + '••••••' + m[2].slice(-2) }; };
-  if (mods.has('CloudPages')) M.content.filter(c => c.isPage).forEach(c => { rulesRun++; const h = secretHit(c.text); if (h) finding('CP-002', A.get(c.key), { why: 'A credential-like value is embedded in page code. Anyone with Content Builder access can read it.', evidence: [['Pattern', h.name + ' = "' + h.masked + '"'], ['Approx. line', String(h.line)], ['Source', 'Static analysis — code not executed']], like: 'MEDIUM', conf: 'MEDIUM', rec: 'Rotate the credential and move it server-side (e.g. encrypted DE or key management).' }); });
-  if (mods.has('Security') || mods.has('Automation')) M.scripts.forEach(s => { rulesRun++; const h = secretHit(s.text); if (h) finding('SEC-SCR-001', A.get(s.key), { why: 'A credential-like value is embedded in an SSJS script activity.', evidence: [['Pattern', h.name + ' = "' + h.masked + '"'], ['Approx. line', String(h.line)]], conf: 'MEDIUM', rec: 'Rotate the credential and load it from a protected store.' }); });
+  // Code findings say where: a Location evidence row per occurrence and code excerpts (secrets masked) in f.code.
+  const secretEvidence = (r) => [['Pattern', r.hits[0].name + ' = "' + r.hits[0].masked + '"'], ['Occurrences', String(r.total)], ...r.hits.map(h => ['Location', at(h)])];
+  const refEvidence = (text, segs, refs) => refs.slice(0, 5).map(r => ({ r, l: locate(text, segs, r.i) }));
+  if (mods.has('CloudPages')) M.content.filter(c => c.isPage).forEach(c => { rulesRun++; const r = secretHits(c.text, c.segs); if (r.total) finding('CP-002', A.get(c.key), { why: 'A credential-like value is embedded in page code. Anyone with Content Builder access can read it.', evidence: [...secretEvidence(r), ['Source', 'Static analysis — code not executed']], code: r.hits.map(h => excerpt(c.text, h)), like: 'MEDIUM', conf: 'MEDIUM', rec: 'Rotate the credential and move it server-side (e.g. encrypted DE or key management).' }); });
+  if (mods.has('Security') || mods.has('Automation')) M.scripts.forEach(s => { rulesRun++; const r = secretHits(s.text, null, 'script'); if (r.total) finding('SEC-SCR-001', A.get(s.key), { why: 'A credential-like value is embedded in an SSJS script activity.', evidence: secretEvidence(r), code: r.hits.map(h => excerpt(s.text, h)), conf: 'MEDIUM', rec: 'Rotate the credential and load it from a protected store.' }); });
   if (mods.has('Content')) M.content.forEach(c => { rulesRun += 2; const a = A.get(c.key);
-    if (c.brokenCb.length) finding('CNT-REF-002', a, { why: 'The asset references content blocks that could not be found.', evidence: [['References', c.brokenCb.slice(0, 5).join(', ')]], conf: 'MEDIUM', rec: 'Replace or remove the reference.', limit: 'Shared/other-BU content may not be visible to this package.' });
-    const cMiss = c.missing.filter(n => canMiss(c.mid, n)); if (cMiss.length) finding('CNT-DE-001', a, { why: 'AMPscript/SSJS references a data extension that could not be resolved.', evidence: [['Unresolved', cMiss.slice(0, 5).join(', ')]], conf: 'MEDIUM', rec: 'Confirm the DE name; use ENT. for shared DEs.', limit: 'Names built dynamically are not resolved.' }); });
+    if (c.brokenCb.length) { const ls = refEvidence(c.text, c.segs, c.brokenCb); finding('CNT-REF-002', a, { why: 'The asset references content blocks that could not be found.', evidence: [['References', c.brokenCb.slice(0, 5).map(x => x.n).join(', ')], ...ls.map(({ r, l }) => ['Location', r.n + ' — ' + at(l)])], code: ls.map(({ l }) => excerpt(c.text, l)), conf: 'MEDIUM', rec: 'Replace or remove the reference.', limit: 'Shared/other-BU content may not be visible to this package.' }); }
+    const cMiss = c.missing.filter(x => canMiss(c.mid, x.n)); if (cMiss.length) { const ls = refEvidence(c.text, c.segs, cMiss); finding('CNT-DE-001', a, { why: 'AMPscript/SSJS references a data extension that could not be resolved.', evidence: [['Unresolved', cMiss.slice(0, 5).map(x => x.n).join(', ')], ...ls.map(({ r, l }) => ['Location', r.n + ' — ' + at(l)])], code: ls.map(({ l }) => excerpt(c.text, l)), conf: 'MEDIUM', rec: 'Confirm the DE name; use ENT. for shared DEs.', limit: 'Names built dynamically are not resolved.' }); } });
   if (mods.has('Security') && M.users.length) {
     rulesRun++;
     const ina = M.users.filter(u => bool(u.ActiveFlag) && !bool(u.IsAPIUser) && ageDays(u.LastSuccessfulLogin) > 90);
@@ -292,4 +333,4 @@ function analyze(M, o) {
   };
 }
 
-module.exports = { RULESET, arr, dig, fmtD, ageDays, hid, plural, bool, RULES, RULE, DOMAIN_OF, DOMAINS, MODULES, SEVS, W, PEN, score, AUTO_STATUS, ACT_TYPE, CONTENT_TYPES, PAGE_TYPES, SECRET_RE, sqlSources, sqlDepth, patternRe, analyze, analyzeParts, emptyM, mergeM, packPart, unpackPart, hasData };
+module.exports = { assetCode, locate, excerpt, maskSecrets, secretHits, RULESET, arr, dig, fmtD, ageDays, hid, plural, bool, RULES, RULE, DOMAIN_OF, DOMAINS, MODULES, SEVS, W, PEN, score, AUTO_STATUS, ACT_TYPE, CONTENT_TYPES, PAGE_TYPES, SECRET_RE, sqlSources, sqlDepth, patternRe, analyze, analyzeParts, emptyM, mergeM, packPart, unpackPart, hasData };

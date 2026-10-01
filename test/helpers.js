@@ -166,6 +166,8 @@ function sfmcOrg(over = {}) {
           assets: [
             { id: 501, customerKey: 'welcome-email', name: 'Welcome Email', assetType: { name: 'htmlemail' }, category: { name: 'Content Builder' }, content: '<p>%%=ContentBlockByKey("hdr")=%%</p>', legacyData: { legacyId: 9001 }, status: { name: 'Draft' }, createdDate: RECENT, modifiedDate: RECENT },
             { id: 502, customerKey: 'hdr', name: 'Header', assetType: { name: 'htmlblock' }, category: { name: 'Blocks' }, content: '<h1>Hi</h1>', createdDate: RECENT, modifiedDate: RECENT },
+            { id: 503, customerKey: 'pref-centre', name: 'Preference Centre', assetType: { name: 'webpage' }, category: { name: 'CloudPages' }, createdDate: RECENT, modifiedDate: RECENT,
+              views: { html: { content: '<html>\n<script runat="server">\n  var client_secret = "pageSecret0123456789";\n</script>\n</html>' } } },
           ],
         },
       },

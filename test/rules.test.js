@@ -271,3 +271,57 @@ describe('no "missing" verdicts without the data to back them', () => {
     assert.ok(!ds.findings.some(f => f.rule === 'DE-ORP-001'));
   });
 });
+
+describe('code findings say where (CloudPages, content, scripts)', () => {
+  const { assetCode } = require('../server/analyze');
+  const S1 = 'abcdef1234567890xyz', S2 = 'QQQQ9999wwwwZZZZ';
+  const pageCode = ['<html>', '%%[ SET @x = 1 ]%%', '<script runat="server">', '  Platform.Load("core", "1.1.1");', '  var client_secret = "' + S1 + '";', '  var apiKey = "' + S2 + '";', '</script>', '%%=ContentBlockByKey("missing-block")=%%', '%%=Lookup("Ghost_DE","a","b","c")=%%', '</html>'].join('\n');
+  const page = () => { const code = assetCode({ content: '', views: { html: { content: pageCode, slots: { main: { blocks: { b1: { content: '<p>block</p>' } } } } } } });
+    return cnt({ id: '701', ck: 'landing', name: 'Landing', typeName: 'webpage', isPage: true, text: code.text, segs: code.segs }); };
+  const findingsFor = () => { const M = empty(); M.content.push(page()); M.scripts.push(tag({ id: 's9', name: 'Script', ck: 's9', text: 'var a = 1;\nvar password = "' + S1 + '";', created: RECENT, modified: RECENT })); M.deDone = [ENT]; return Object.fromEntries(run(M).ds.findings.map(f => [f.rule, f])); };
+
+  test('assetCode keeps raw code per segment, labelled by where it lives in the asset', () => {
+    const c = assetCode({ content: 'top', views: { html: { content: 'a\nb', slots: { main: { blocks: { b1: { content: 'blk', superContent: 'sup' } } } } }, subjectline: { content: 'Hi' } } });
+    assert.deepEqual(c.segs.map(s => s[0]), ['content', 'views.html', 'views.html.slots.main.blocks.b1', 'views.html.slots.main.blocks.b1.superContent', 'views.subjectline']);
+    assert.equal(c.text, 'top\na\nb\nblk\nsup\nHi');
+  });
+
+  test('CP-002: a secret in views.html is found (it was missed when views were JSON-escaped) and located exactly', () => {
+    const f = findingsFor()['CP-002'];
+    assert.ok(f, 'CP-002 raised');
+    const ev = Object.fromEntries(f.evidence.filter(e => e[0] !== 'Location'));
+    assert.equal(ev.Occurrences, '2');
+    assert.deepEqual(f.evidence.filter(e => e[0] === 'Location').map(e => e[1]), ['views.html · line 5, col 7', 'views.html · line 6, col 7']);
+    const [x] = f.code;
+    assert.deepEqual([x.where, x.line, x.col], ['views.html', 5, 7]);
+    assert.deepEqual(x.lines.map(l => l[0]), [3, 4, 5, 6, 7], 'two lines either side');
+    assert.deepEqual(x.lines.filter(l => l[2]).map(l => l[0]), [5], 'the problem line is flagged');
+    assert.equal(x.lines[2][1], '  var client_secret = "ab••••••yz";');
+    const all = JSON.stringify(f);
+    assert.ok(!all.includes(S1) && !all.includes(S2), 'no secret value anywhere in the finding, neighbouring lines included');
+  });
+
+  test('a long minified line is trimmed around the hit, and the secret is still masked', () => {
+    const long = 'x'.repeat(5000) + ' var password = "' + S1 + '"; ' + 'y'.repeat(5000);
+    const { text, segs } = assetCode({ views: { html: { content: long } } });
+    const M = empty(); M.content.push(cnt({ id: '702', ck: 'min', name: 'Minified', typeName: 'webpage', isPage: true, text, segs }));
+    const f = run(M).ds.findings.find(x => x.rule === 'CP-002');
+    const line = f.code[0].lines[0][1];
+    assert.ok(line.length < 260 && line.startsWith('… ') && line.endsWith(' …'), line.length + ' chars');
+    assert.match(line, /password = "ab••••••yz"/);
+    assert.ok(!JSON.stringify(f).includes(S1));
+  });
+
+  test('CNT-REF-002 and CNT-DE-001 point at each unresolved reference', () => {
+    const fs_ = findingsFor();
+    assert.deepEqual(fs_['CNT-REF-002'].evidence.filter(e => e[0] === 'Location').map(e => e[1]), ['missing-block — views.html · line 8, col 4']);
+    assert.deepEqual(fs_['CNT-DE-001'].evidence.filter(e => e[0] === 'Location').map(e => e[1]), ['Ghost_DE — views.html · line 9, col 4']);
+    assert.equal(fs_['CNT-DE-001'].code[0].lines.find(l => l[2])[1], '%%=Lookup("Ghost_DE","a","b","c")=%%');
+  });
+
+  test('SEC-SCR-001 locates the line in the script', () => {
+    const f = findingsFor()['SEC-SCR-001'];
+    assert.deepEqual(f.evidence.filter(e => e[0] === 'Location').map(e => e[1]), ['script · line 2, col 5']);
+    assert.ok(!JSON.stringify(f).includes(S1));
+  });
+});

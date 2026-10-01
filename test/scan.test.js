@@ -12,7 +12,7 @@ let fake;
 const install = (org) => (fake = fakeSfmc(org).install());
 afterEach(() => { if (fake) { assertReadOnly(fake.calls); fake.restore(); fake = null; } });
 
-const EXPECTED = ['AUTO-FAIL-002', 'DE-RET-001', 'JRN-COR-004', 'SEC-SCR-001', 'SQL-001', 'USR-INA-001'];
+const EXPECTED = ['AUTO-FAIL-002', 'CP-002', 'DE-RET-001', 'JRN-COR-004', 'SEC-SCR-001', 'SQL-001', 'USR-INA-001'];
 
 test('full scan collects every module, builds the graph and raises the expected findings', async () => {
   install(sfmcOrg());
@@ -29,6 +29,9 @@ test('full scan collects every module, builds the graph and raises the expected 
   assert.ok(ds.graph.edges.some(e => e[0] === 'DE:100:shared_subs' && e[1] === 'SQL:200:q_retail_feed'), 'ENT. source resolved across BUs');
   assert.ok(ds.graph.edges.some(e => e[0] === 'JRN:200:welcome' && e[1] === 'CNT:200:501' && e[2] === 'SENDS'), 'journey email resolved via legacyId');
   assert.ok(api.calls > 0);
+  const cp = ds.findings.find(f => f.rule === 'CP-002');
+  assert.deepEqual(cp.evidence.find(e => e[0] === 'Location'), ['Location', 'views.html · line 3, col 7'], 'CloudPage secret located in views.html');
+  assert.ok(!JSON.stringify(ds).includes('pageSecret0123456789'), 'secret never in the dataset');
   // a BU-scoped token was requested for each scanned BU
   const mids = fake.calls.filter(c => c.path === '/v2/token').map(c => JSON.parse(c.body).account_id).filter(Boolean);
   assert.ok(mids.includes('100') && mids.includes('200'));
