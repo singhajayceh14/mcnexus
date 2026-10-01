@@ -8,9 +8,13 @@ MCNexus is a read-only assessment tool for Salesforce Marketing Cloud Engagement
 ## Layout
 - `MCNexus App.dc.html` — **the product UI.** One Design Component: a template plus a `class Component extends DCLogic` logic block. Opens directly in a browser.
 - `support.js` — DC runtime. Never edit by hand.
-- `server/mcnexus-server.js` — **the backend.** Node 18+, no npm dependencies. Serves the UI, handles auth, stores data and calls SFMC.
+- `server/mcnexus-server.js` — **the backend.** Node 22+. Serves the UI, handles auth and sessions, calls SFMC, runs the rules.
+- `server/store.js` — the storage contract (documented at the top) and `JsonStore` (default). `server/store-pg.js` — `PgStore` for PostgreSQL/Neon, chosen when `DATABASE_URL` is set. Routes only talk to `store`; never read or write files or SQL from a route.
+- `server/schema.sql` — PostgreSQL schema. Idempotent; each statement ends with `;` at end of line and contains no other `;` (the Neon HTTP driver runs them one by one). Change it by appending, and bump `schema_version` / `SCHEMA_VERSION`.
+- `server/migrate-json-to-pg.js` — installs the schema and copies a JSON data folder into PostgreSQL.
+- `test/` — `node:test` suites. SFMC is faked in `test/helpers.js`; the store and API suites run on both stores (PostgreSQL via PGlite).
 - `server/README.md` — how to run it and how to set up the SFMC installed package.
-- `server/data/` — created at runtime (store.json, .key, scans/). **Never commit.**
+- `server/data/` — created at runtime by the JSON store (store.json, .key, scans/). **Never commit.** Also never commit `.env` files (`DATABASE_URL`, `MCNEXUS_KEY`).
 - `MCNexus Prototype.dc.html` — the original clickable prototype (ACME demo data). Keep it as a design reference only.
 - `_ds/industry-…/` — the bound **Industry** design system (styles.css + bundle).
 - `uploads/MCNexus_Solution_Design.md` — the original solution design brief.
@@ -53,4 +57,5 @@ Asset keys are `TYPE:MID:id`: DE, SQL, AUTO, IMP, SCR, JRN, CNT. Virtual node ke
 ## Commands
 - Run: `node server/mcnexus-server.js` (or `npm start`), then open http://127.0.0.1:8787
 - Syntax check: `node --check server/mcnexus-server.js`
-- Tests: `npm test` (`node:test`, no dependencies). SFMC is faked in `test/helpers.js`; tests never reach a real org.
+- Tests: `npm install` once, then `npm test`. Tests never reach a real org. Without `npm install` the PostgreSQL suites skip. `MCNEXUS_TEST_PG=<url>` also runs the store contract against a real database (use an empty Neon branch: it deletes rows).
+- PostgreSQL: `DATABASE_URL=… npm run db:schema` installs the schema; `DATABASE_URL=… npm run db:migrate [-- --from server/data]` copies a JSON data folder. `MCNEXUS_KEY` is required whenever `DATABASE_URL` is set.

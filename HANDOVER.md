@@ -25,7 +25,7 @@ MCNexus connects to a Salesforce Marketing Cloud Engagement org through a server
 | `uploads/MCNexus_Solution_Design.md` | Original solution design brief |
 
 ## 3. Quick start
-1. Install Node 18 or newer.
+1. Install Node 22 or newer.
 2. From the project folder, run `npm start` (or `node server/mcnexus-server.js`).
 3. Open http://127.0.0.1:8787. The first sign-in creates the **Owner** account (password 8+ characters).
 4. In SFMC, create an Installed Package with an **API Integration → Server-to-Server** component. Grant the read scopes listed in `server/README.md` and give it access to every Business Unit you want scanned.
@@ -41,8 +41,9 @@ Browser (MCNexus App.dc.html)
    ▼
 Node server (server/mcnexus-server.js)
    ├─ Auth: scrypt passwords, in-memory sessions (8h idle)
-   ├─ Store: server/data/store.json (users, connections, scan index, triage, settings)
-   │         server/data/scans/<connId>/<n>.json (full snapshot per scan)
+   ├─ Store (server/store.js): one async contract, two backends
+   │    JSON (default): server/data/store.json + scans/<connId>/<n>.json
+   │    PostgreSQL (DATABASE_URL, Neon): server/store-pg.js + server/schema.sql
    ├─ Crypto: AES-256-GCM for client secrets (server/data/.key or MCNEXUS_KEY)
    └─ SFMC client: OAuth2 client_credentials per BU (account_id), REST + SOAP,
                    pagination, 429/5xx retry with backoff, property fallback
@@ -125,19 +126,19 @@ Severity overrides and enable/disable are set in **Admin → Rules** and apply f
 - **Limits for large orgs:** capped by `MCNEXUS_MAX_PAGES` and `MCNEXUS_MAX_DETAIL`. When a cap is hit, coverage is marked PARTIAL. The UI shows the first 400 findings or assets per filter.
 - **Deployment:**
   - Sessions are in-memory, so a restart signs users out.
-  - It runs as a single process with a JSON-file store. That suits a consultant laptop or a single VM.
-  - For multi-user hosting, move the store to a database and put TLS in front.
+  - Scan jobs are in memory, so it runs as a single process. Storage can be JSON files (laptop or single VM) or PostgreSQL (`DATABASE_URL`, Neon). See "Moving to PostgreSQL" in server/README.md.
+  - For multi-user hosting, put TLS in front.
 - **Report formats:** PDF uses the browser print dialog. "Excel" exports CSV (UTF-8 with BOM).
 
 ## 8. Recommended next steps
 1. Run a first scan against a sandbox. Fix any field-shape issues reported in the scan log.
 2. Add automation run history (the legacy automation instance endpoints) to strengthen AUTO-FAIL-002 and JRN-COR-004.
 3. Add user role retrieval (SOAP Role / AccountUser roles) to restore admin-specific inactivity checks.
-4. Move to SQLite or Postgres, add persistent sessions, and add multi-user roles (Owner / Consultant / Viewer).
-5. Add a CI syntax check (`node --check`) and fixture-based tests for `analyze()`.
+4. Add persistent sessions and multi-user roles (Owner / Admin / Consultant / Viewer). PostgreSQL storage is done; its schema already has the session, invite and password-reset tables.
+5. Add CI (GitHub Actions) that runs `npm ci && npm test` on every push. The test suites exist (`test/`).
 
 ## 9. Operations
-- **Backup:** copy `server/data/` (it contains `.key` — without it, stored secrets can't be decrypted).
+- **Backup:** JSON storage: copy `server/data/` (it contains `.key` — without it, stored secrets can't be decrypted). PostgreSQL: Neon point-in-time restore or branches, plus a safe copy of `MCNEXUS_KEY`.
 - **Key rotation:**
   1. Export the connections.
   2. Set a new `MCNEXUS_KEY`.
