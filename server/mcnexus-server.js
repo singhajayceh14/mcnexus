@@ -103,13 +103,16 @@ class SFMC {
     const t = await this.token(mid);
     return this.req(t.rest + p, { method, headers: { authorization: 'Bearer ' + t.access, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined }, (x) => x ? JSON.parse(x) : {});
   }
+  // Results cut off by the page cap come back with out.truncated = true; callers report that as partial coverage.
   async restPages(mid, p, { size = 200, sizeParam = '$pagesize', key = 'items', max = MAX_PAGES } = {}) {
     const out = [];
-    for (let page = 1; page <= max; page++) {
+    for (let page = 1; ; page++) {
+      if (page > max) { out.truncated = true; break; }
       const j = await this.rest(mid, 'GET', `${p}${p.includes('?') ? '&' : '?'}$page=${page}&${sizeParam}=${size}`);
       const items = j[key] || []; out.push(...items);
       const total = j.count != null ? j.count : j.totalCount;
-      if (!items.length || items.length < size || (total != null && out.length >= total)) break;
+      // SFMC may cap the page size below `size`, so a short page only means "last page" when no total is given.
+      if (!items.length || (total != null ? out.length >= total : items.length < size)) break;
     }
     return out;
   }
@@ -120,7 +123,8 @@ class SFMC {
   }
   async retrieve(mid, type, props, { filter = '', all = false, max = MAX_PAGES } = {}) {
     const out = []; let reqId = null;
-    for (let page = 0; page < max; page++) {
+    for (let page = 0; ; page++) {
+      if (page >= max) { out.truncated = true; break; }
       const inner = `<ObjectType>${type}</ObjectType>${props.map(p => `<Properties>${p}</Properties>`).join('')}${filter}${reqId ? `<ContinueRequest>${reqId}</ContinueRequest>` : ''}${all ? '<QueryAllAccounts>true</QueryAllAccounts>' : ''}`;
       const o = await this.soap(mid, 'Retrieve', `<RetrieveRequestMsg xmlns="http://exacttarget.com/wsdl/partnerAPI"><RetrieveRequest>${inner}</RetrieveRequest></RetrieveRequestMsg>`);
       const m = dig(o, 'Envelope', 'Body', 'RetrieveResponseMsg') || {};
@@ -146,6 +150,7 @@ async function discoverBus(api, mid) {
   const entId = ctx && ctx.enterprise && ctx.enterprise.id ? String(ctx.enterprise.id) : null;
   let rows = [], err = null;
   try { rows = await api.retrieve(mid, 'BusinessUnit', ['ID', 'Name', 'ParentID'], { all: true }); } catch (e) { err = e; }
+  const truncated = !!rows.truncated;
   let bus = rows.map(r => ({ mid: String(r.ID), name: r.Name || ('Business Unit ' + r.ID), parentMid: r.ParentID && r.ParentID !== '0' && String(r.ParentID) !== String(r.ID) ? String(r.ParentID) : null }));
   const seen = new Set(); bus = bus.filter(b => !seen.has(b.mid) && seen.add(b.mid));
   if (entId && !bus.find(b => b.mid === entId)) bus.unshift({ mid: entId, name: 'Enterprise ' + entId, parentMid: null });
@@ -153,7 +158,7 @@ async function discoverBus(api, mid) {
   bus.forEach(b => { if (entId && b.mid === entId) b.parentMid = null; });
   bus.sort((a, b) => (a.parentMid ? 1 : 0) - (b.parentMid ? 1 : 0) || a.name.localeCompare(b.name));
   const byMid = Object.fromEntries(bus.map(b => [b.mid, b]));
-  return { ctx, entId, err, bus: bus.map(b => ({ mid: b.mid, name: b.name, short: b.name, parentMid: b.parentMid, parent: b.parentMid ? (byMid[b.parentMid] ? byMid[b.parentMid].name : b.parentMid) : '—' })) };
+  return { ctx, entId, err, truncated, bus: bus.map(b => ({ mid: b.mid, name: b.name, short: b.name, parentMid: b.parentMid, parent: b.parentMid ? (byMid[b.parentMid] ? byMid[b.parentMid].name : b.parentMid) : '—' })) };
 }
 const scopeList = (s) => String(s || '').split(/\s+/).filter(Boolean);
 
@@ -267,6 +272,7 @@ async function runScan(job, conn, opts) {
   const mark = (m, ok, note) => { const c = cov[m]; ok ? c.ok++ : c.fail++; if (note && c.notes.length < 4 && !c.notes.includes(note)) c.notes.push(note); if (!ok) job.counts.warnings++; };
   const setMod = (m, st) => { job.mods[m] = st; };
   const check = () => { if (job.cancelled) throw new ApiErr('Cancelled by user', 0, 'cancel'); };
+  const capped = (m, label, list) => { if (list && list.truncated) { mark(m, false, label + ': page limit reached (' + MAX_PAGES + ' pages)'); L(label + ': stopped at the page limit, results incomplete'); } return list; };
   MODULES.forEach(m => job.mods[m] = mods.has(m) ? 'QUEUED' : 'SKIPPED');
   const M = { des: [], fields: {}, folders: {}, queries: [], autos: [], imports: [], scripts: [], journeys: [], evs: [], content: [], users: [], deDone: [] };
 
@@ -275,18 +281,18 @@ async function runScan(job, conn, opts) {
   const t = await api.token(conn.mid || null); L('Token issued · ' + scopeList(t.scope).length + ' scopes');
   const disc = await discoverBus(api, conn.mid || null);
   const entMid = disc.entId || (disc.bus[0] && disc.bus[0].mid);
-  mark('Organization', !disc.err, disc.err && ('BU discovery: ' + disc.err.message));
+  mark('Organization', !disc.err, disc.err && ('BU discovery: ' + disc.err.message)); capped('Organization', 'BU discovery', disc.truncated && { truncated: true });
   const allBus = disc.bus; const wanted = new Set((opts.mids && opts.mids.length ? opts.mids : allBus.map(b => b.mid)).map(String));
   const bus = allBus.filter(b => wanted.has(b.mid));
   L('Discovered ' + plural(allBus.length, 'Business Unit') + (entMid ? ' under Enterprise ' + entMid : '') + ' · scanning ' + bus.length);
-  setMod('Organization', disc.err ? 'PARTIAL' : 'SUCCESS');
+  setMod('Organization', disc.err || disc.truncated ? 'PARTIAL' : 'SUCCESS');
   const totalSteps = bus.length * 6 + 3; let done = 1;
   const tick = () => { done++; job.pct = Math.min(97, Math.round(done / totalSteps * 100)); };
   tick();
 
   if (mods.has('Security')) {
     job.cur = 'Security'; setMod('Security', 'RUNNING');
-    try { M.users = await api.retrieveSafe(conn.mid || null, 'AccountUser', ['ID', 'UserID', 'Name', 'Email', 'ActiveFlag', 'IsAPIUser', 'LastSuccessfulLogin', 'CreatedDate', 'Client.ID'], ['ID', 'UserID', 'Name', 'ActiveFlag', 'LastSuccessfulLogin'], { all: true }); mark('Security', true); L('Collected ' + plural(M.users.length, 'user') + ' (SOAP AccountUser)'); }
+    try { M.users = capped('Security', 'Users', await api.retrieveSafe(conn.mid || null, 'AccountUser', ['ID', 'UserID', 'Name', 'Email', 'ActiveFlag', 'IsAPIUser', 'LastSuccessfulLogin', 'CreatedDate', 'Client.ID'], ['ID', 'UserID', 'Name', 'ActiveFlag', 'LastSuccessfulLogin'], { all: true })); mark('Security', true); L('Collected ' + plural(M.users.length, 'user') + ' (SOAP AccountUser)'); }
     catch (e) { mark('Security', false, 'Users: ' + e.message); L('Users unavailable — ' + e.message); }
   }
   tick();
@@ -300,12 +306,13 @@ async function runScan(job, conn, opts) {
     if (mods.has('Data')) {
       job.cur = 'Data · ' + B; setMod('Data', 'RUNNING');
       try {
-        const des = await api.retrieveSafe(mid, 'DataExtension', ['ObjectID', 'CustomerKey', 'Name', 'IsSendable', 'CategoryID', 'CreatedDate', 'ModifiedDate', 'DataRetentionPeriodLength', 'DataRetentionPeriod', 'RowBasedRetention', 'RetainUntil', 'DeleteAtEndOfRetentionPeriod', 'Description', 'SendableDataExtensionField.Name', 'SendableSubscriberField.Name'], ['ObjectID', 'CustomerKey', 'Name', 'IsSendable', 'CategoryID', 'CreatedDate', 'ModifiedDate']);
+        const des = capped('Data', B + ' DEs', await api.retrieveSafe(mid, 'DataExtension', ['ObjectID', 'CustomerKey', 'Name', 'IsSendable', 'CategoryID', 'CreatedDate', 'ModifiedDate', 'DataRetentionPeriodLength', 'DataRetentionPeriod', 'RowBasedRetention', 'RetainUntil', 'DeleteAtEndOfRetentionPeriod', 'Description', 'SendableDataExtensionField.Name', 'SendableSubscriberField.Name'], ['ObjectID', 'CustomerKey', 'Name', 'IsSendable', 'CategoryID', 'CreatedDate', 'ModifiedDate']));
         des.forEach(d => M.des.push(tag({ objectId: d.ObjectID, ck: d.CustomerKey, name: d.Name, sendable: bool(d.IsSendable), categoryId: d.CategoryID, created: d.CreatedDate, modified: d.ModifiedDate, retLen: d.DataRetentionPeriodLength, retPeriod: d.DataRetentionPeriod, rowRet: bool(d.RowBasedRetention), retainUntil: d.RetainUntil, deleteAtEnd: bool(d.DeleteAtEndOfRetentionPeriod), retKnown: d.DataRetentionPeriodLength !== undefined || d.RowBasedRetention !== undefined, desc: d.Description, sendField: dig(d, 'SendableDataExtensionField', 'Name'), subField: dig(d, 'SendableSubscriberField', 'Name') })));
-        L(B + ': ' + plural(des.length, 'Data Extension') + ' (SOAP)'); job.counts.assets += des.length; mark('Data', true); M.deDone.push(mid);
+        L(B + ': ' + plural(des.length, 'Data Extension') + ' (SOAP)'); job.counts.assets += des.length; mark('Data', true); if (!des.truncated) M.deDone.push(mid);
         try {
-          const fs_ = await api.retrieveSafe(mid, 'DataExtensionField', ['Name', 'IsPrimaryKey', 'FieldType', 'IsRequired', 'DataExtension.CustomerKey'], ['Name', 'IsPrimaryKey', 'DataExtension.CustomerKey']);
-          fs_.forEach(f => { const k = mid + '|' + dig(f, 'DataExtension', 'CustomerKey'); (M.fields[k] = M.fields[k] || []).push({ name: f.Name, pk: bool(f.IsPrimaryKey), type: f.FieldType }); });
+          const fs_ = capped('Data', B + ' DE fields', await api.retrieveSafe(mid, 'DataExtensionField', ['Name', 'IsPrimaryKey', 'FieldType', 'IsRequired', 'DataExtension.CustomerKey'], ['Name', 'IsPrimaryKey', 'DataExtension.CustomerKey']));
+          // A cut-off field list can end mid-DE; leave fields uncollected rather than report a false "no primary key".
+          if (!fs_.truncated) fs_.forEach(f => { const k = mid + '|' + dig(f, 'DataExtension', 'CustomerKey'); (M.fields[k] = M.fields[k] || []).push({ name: f.Name, pk: bool(f.IsPrimaryKey), type: f.FieldType }); });
           L(B + ': ' + fs_.length.toLocaleString('en-US') + ' DE fields');
         } catch (e) { mark('Data', false, B + ' fields: ' + e.message); }
         try { const fo = await api.retrieve(mid, 'DataFolder', ['ID', 'Name', 'ParentFolder.ID', 'ContentType']); fo.forEach(f => { M.folders[mid + '|' + f.ID] = { name: f.Name, parent: dig(f, 'ParentFolder', 'ID') }; }); } catch { }
@@ -316,7 +323,7 @@ async function runScan(job, conn, opts) {
     if (mods.has('SQL')) {
       job.cur = 'SQL · ' + B; setMod('SQL', 'RUNNING');
       try {
-        const qs = await api.retrieveSafe(mid, 'QueryDefinition', ['ObjectID', 'CustomerKey', 'Name', 'QueryText', 'TargetType', 'DataExtensionTarget.Name', 'DataExtensionTarget.CustomerKey', 'TargetUpdateType', 'CreatedDate', 'ModifiedDate', 'CategoryID'], ['ObjectID', 'CustomerKey', 'Name', 'QueryText', 'DataExtensionTarget.Name', 'DataExtensionTarget.CustomerKey', 'TargetUpdateType', 'CreatedDate', 'ModifiedDate']);
+        const qs = capped('SQL', B + ' queries', await api.retrieveSafe(mid, 'QueryDefinition', ['ObjectID', 'CustomerKey', 'Name', 'QueryText', 'TargetType', 'DataExtensionTarget.Name', 'DataExtensionTarget.CustomerKey', 'TargetUpdateType', 'CreatedDate', 'ModifiedDate', 'CategoryID'], ['ObjectID', 'CustomerKey', 'Name', 'QueryText', 'DataExtensionTarget.Name', 'DataExtensionTarget.CustomerKey', 'TargetUpdateType', 'CreatedDate', 'ModifiedDate']));
         qs.forEach(q => M.queries.push(tag({ objectId: q.ObjectID, ck: q.CustomerKey, name: q.Name, text: q.QueryText || '', targetName: dig(q, 'DataExtensionTarget', 'Name'), targetCk: dig(q, 'DataExtensionTarget', 'CustomerKey'), update: q.TargetUpdateType, created: q.CreatedDate, modified: q.ModifiedDate })));
         L(B + ': ' + plural(qs.length, 'SQL Query') + ' (SOAP)'); job.counts.assets += qs.length; mark('SQL', true);
       } catch (e) { mark('SQL', false, B + ': ' + e.message); L(B + ': SQL failed — ' + e.message); }
@@ -326,7 +333,7 @@ async function runScan(job, conn, opts) {
     if (mods.has('Automation')) {
       job.cur = 'Automation · ' + B; setMod('Automation', 'RUNNING');
       try {
-        const list = await api.restPages(mid, '/automation/v1/automations', { size: 200 });
+        const list = capped('Automation', B + ' automations', await api.restPages(mid, '/automation/v1/automations', { size: 200 }));
         const det = await pMap(list.slice(0, MAX_DETAIL), CONCURRENCY, a => api.rest(mid, 'GET', '/automation/v1/automations/' + a.id).catch(() => a));
         det.concat(list.slice(MAX_DETAIL)).forEach(a => {
           const sid = a.statusId != null ? a.statusId : a.status;
@@ -337,16 +344,16 @@ async function runScan(job, conn, opts) {
         if (list.length > MAX_DETAIL) mark('Automation', false, B + ': detail limited to ' + MAX_DETAIL + ' automations');
         L(B + ': ' + plural(list.length, 'Automation') + ' · ' + M.autos.filter(a => a.mid === mid).reduce((n, a) => n + a.steps.length, 0) + ' activities (REST)'); job.counts.assets += list.length; mark('Automation', true);
       } catch (e) { mark('Automation', false, B + ': ' + e.message); L(B + ': Automations failed — ' + e.message); }
-      try { const im = await api.restPages(mid, '/automation/v1/imports', { size: 200 }); im.forEach(i => M.imports.push(tag({ id: i.importDefinitionId || i.id, name: i.name, ck: i.customerKey, destId: i.destinationObjectId, destName: i.destinationName, modified: i.modifiedDate }))); job.counts.assets += im.length; } catch (e) { mark('Automation', false, B + ' imports: ' + e.message); }
-      try { const sc = await api.restPages(mid, '/automation/v1/scripts', { size: 200 }); sc.forEach(x => M.scripts.push(tag({ id: x.ssjsActivityId || x.id, name: x.name, ck: x.key, text: x.script || '', modified: x.modifiedDate, created: x.createdDate }))); job.counts.assets += sc.length; } catch (e) { mark('Automation', false, B + ' scripts: ' + e.message); }
+      try { const im = capped('Automation', B + ' imports', await api.restPages(mid, '/automation/v1/imports', { size: 200 })); im.forEach(i => M.imports.push(tag({ id: i.importDefinitionId || i.id, name: i.name, ck: i.customerKey, destId: i.destinationObjectId, destName: i.destinationName, modified: i.modifiedDate }))); job.counts.assets += im.length; } catch (e) { mark('Automation', false, B + ' imports: ' + e.message); }
+      try { const sc = capped('Automation', B + ' scripts', await api.restPages(mid, '/automation/v1/scripts', { size: 200 })); sc.forEach(x => M.scripts.push(tag({ id: x.ssjsActivityId || x.id, name: x.name, ck: x.key, text: x.script || '', modified: x.modifiedDate, created: x.createdDate }))); job.counts.assets += sc.length; } catch (e) { mark('Automation', false, B + ' scripts: ' + e.message); }
     }
     tick(); check();
 
     if (mods.has('Journey')) {
       job.cur = 'Journey · ' + B; setMod('Journey', 'RUNNING');
       try {
-        const js = await api.restPages(mid, '/interaction/v1/interactions?mostRecentVersionOnly=false', { size: 100, sizeParam: '$pageSize' });
-        const evs = await api.restPages(mid, '/interaction/v1/eventDefinitions', { size: 100, sizeParam: '$pageSize' }).catch(() => []);
+        const js = capped('Journey', B + ' journeys', await api.restPages(mid, '/interaction/v1/interactions?mostRecentVersionOnly=false', { size: 100, sizeParam: '$pageSize' }));
+        const evs = capped('Journey', B + ' event definitions', await api.restPages(mid, '/interaction/v1/eventDefinitions', { size: 100, sizeParam: '$pageSize' }).catch(() => []));
         evs.forEach(e => M.evs.push(tag({ key: e.eventDefinitionKey, deId: e.dataExtensionId, deName: e.dataExtensionName, type: e.type })));
         const byKey = {}; js.forEach(j => { const k = j.key || j.id; (byKey[k] = byKey[k] || []).push(j); });
         const latest = Object.values(byKey).map(v => v.sort((a, b) => (b.version || 0) - (a.version || 0))[0]);
@@ -368,8 +375,9 @@ async function runScan(job, conn, opts) {
       const types = [...(mods.has('Content') ? CONTENT_TYPES : []), ...(mods.has('CloudPages') ? PAGE_TYPES : [])];
       job.cur = 'Content · ' + B; if (mods.has('Content')) setMod('Content', 'RUNNING'); if (mods.has('CloudPages')) setMod('CloudPages', 'RUNNING');
       try {
-        let page = 1, got = 0, total = null;
-        for (; page <= MAX_PAGES; page++) {
+        let page = 1, got = 0, total = null, cut = false;
+        for (; ; page++) {
+          if (page > MAX_PAGES) { cut = true; break; }
           const j = await api.rest(mid, 'POST', '/asset/v1/content/assets/query', { page: { page, pageSize: 200 }, query: { property: 'assetType.name', simpleOperator: 'in', value: types }, fields: ['id', 'customerKey', 'name', 'assetType', 'category', 'modifiedDate', 'createdDate', 'content', 'views', 'legacyData', 'status'] });
           const items = j.items || []; total = j.count; got += items.length;
           items.forEach(a => {
@@ -377,9 +385,9 @@ async function runScan(job, conn, opts) {
             let text = (a.content || '') + '\n' + (a.views ? JSON.stringify(a.views) : ''); if (text.length > 300000) text = text.slice(0, 300000);
             M.content.push(tag({ id: String(a.id), ck: a.customerKey, name: a.name, typeName: tn, isPage: PAGE_TYPES.includes(tn), folder: dig(a, 'category', 'name'), modified: a.modifiedDate, created: a.createdDate, legacyId: dig(a, 'legacyData', 'legacyId'), status: dig(a, 'status', 'name'), text }));
           });
-          if (items.length < 200 || (total != null && got >= total)) break;
+          if (!items.length || (total != null ? got >= total : items.length < 200)) break;
         }
-        if (total != null && got < total) { ['Content', 'CloudPages'].forEach(m => mods.has(m) && mark(m, false, B + ': ' + got + ' of ' + total + ' assets paged (limit)')); }
+        if (cut || (total != null && got < total)) { ['Content', 'CloudPages'].forEach(m => mods.has(m) && mark(m, false, B + ': ' + got + ' of ' + (total != null ? total : '?') + ' assets paged (page limit)')); }
         L(B + ': Content Builder ' + got.toLocaleString('en-US') + ' assets paged'); job.counts.assets += got;
         if (mods.has('Content')) mark('Content', true); if (mods.has('CloudPages')) mark('CloudPages', true);
       } catch (e) { ['Content', 'CloudPages'].forEach(m => mods.has(m) && mark(m, false, B + ': ' + e.message)); L(B + ': Content failed — ' + e.message); }

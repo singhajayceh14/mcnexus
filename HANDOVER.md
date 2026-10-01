@@ -112,6 +112,8 @@ Severity overrides and enable/disable are set in **Admin → Rules** and apply f
 **Changes in v2.1** (no finding IDs changed):
 - SQL-TGT-001, SQL-SRC-001, JRN-ENT-001 and CNT-DE-001 only report a DE as missing when that Business Unit's DE list was collected. `ENT.` names need the Enterprise BU to have been scanned. Before, a scan without Data, a BU whose DE retrieve failed, or a child-BU-only scan reported every reference as missing.
 - DE-ORP-001 only runs when SQL, Automation, Journey, Content and CloudPages all ran without failures. Before, a Quick Scan marked every DE unchanged for a year as orphaned. The scan log notes when the check is skipped.
+- Hitting `MCNEXUS_MAX_PAGES` on any SOAP retrieve or REST list now marks that module PARTIAL. Before, only automation/journey detail and content were flagged; everything else was cut off silently. A BU whose DE list was cut off is treated as not collected for the missing-DE rules. A cut-off field list is discarded, so it can't produce a false DE-PK-001.
+- REST paging trusts the reported total over a short page, because SFMC can return fewer items per page than requested. Before, a short first page ended collection after page 1.
 
 ## 7. Status and known limitations
 - **Not yet validated against a live tenant.**
