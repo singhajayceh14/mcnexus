@@ -42,6 +42,39 @@ function contract(name, make) {
       assert.equal(await store.setPassword('nobody@example.test', 'x', 'y'), false);
     });
 
+    test('sessions: create, read, touch, list, end others, purge expired', async () => {
+      const [{ email }] = await store.listUsers(), t = 1_800_000_000_000;
+      const ses = (hash, o = {}) => ({ hash, email, created: t, seen: t, expires: t + 8 * 3600e3, ua: 'UA ' + hash, ip: '10.0.0.1', ...o });
+      assert.equal(await store.createSession(ses('h1')), true);
+      assert.equal(await store.createSession(ses('h2', { created: t + 1000 })), true);
+      assert.equal(await store.createSession(ses('h3', { created: t + 2000, expires: t - 1 })), true);
+      assert.equal(await store.createSession({ ...ses('hx'), email: 'nobody@example.test' }), false, 'unknown user');
+      assert.deepEqual(await store.getSession('h1'), ses('h1'));
+      assert.equal(await store.getSession('nope'), null);
+      await store.touchSession('h1', t + 60e3, t + 60e3 + 8 * 3600e3);
+      assert.deepEqual([(await store.getSession('h1')).seen, (await store.getSession('h1')).expires], [t + 60e3, t + 60e3 + 8 * 3600e3]);
+      assert.deepEqual((await store.listSessions(email)).map(x => x.hash), ['h1', 'h2', 'h3']);
+      assert.equal(await store.purgeExpired(t), 1, 'h3 expired');
+      assert.equal(await store.deleteSessions(email, 'h1'), 1);
+      assert.deepEqual((await store.listSessions(email)).map(x => x.hash), ['h1']);
+      assert.equal(await store.deleteSession('h1'), true);
+      assert.equal(await store.deleteSession('h1'), false);
+      assert.deepEqual(await store.listSessions(email), []);
+    });
+
+    test('failed sign-ins: fixed window from the first failure, reset after it, cleared on demand', async () => {
+      const t = 1_800_000_000_000, W = 15 * 60e3;
+      assert.deepEqual(await store.countFailures('email:a', t, W), { count: 0, resetAt: t });
+      assert.deepEqual(await store.recordFailure('email:a', t, W), { count: 1, resetAt: t + W });
+      assert.deepEqual(await store.recordFailure('email:a', t + 1000, W), { count: 2, resetAt: t + W });
+      assert.deepEqual(await store.countFailures('email:a', t + 2000, W), { count: 2, resetAt: t + W });
+      assert.equal((await store.countFailures('email:b', t, W)).count, 0, 'keys are independent');
+      assert.equal((await store.countFailures('email:a', t + W, W)).count, 0, 'window over');
+      assert.deepEqual(await store.recordFailure('email:a', t + W + 5, W), { count: 1, resetAt: t + 2 * W + 5 }, 'new window');
+      await store.clearFailures('email:a');
+      assert.equal((await store.countFailures('email:a', t + W + 6, W)).count, 0);
+    });
+
     test('settings: sections round-trip, unknown sections are rejected', async () => {
       assert.deepEqual(await store.getSettings(), {});
       await store.putSettings({ rulesX: { 'SQL-001': { enabled: false } }, naming: [['Data Extension', 'DE_<NAME>']] });
@@ -140,7 +173,7 @@ describe('PostgreSQL schema', { skip: NO_PGLITE }, () => {
     await assert.rejects(new PgStore(a).init(), /schema is not installed.*db:schema/);
     await a.exec(SCHEMA()); await a.exec(SCHEMA());
     await new PgStore(a).init();
-    assert.deepEqual(await a.query('SELECT version FROM schema_version', []), [{ version: 1 }]);
+    assert.deepEqual(await a.query('SELECT version FROM schema_version ORDER BY version', []), [{ version: 1 }, { version: 2 }]);
   });
 
   test('constraints: lower-case emails, known roles and settings sections only', async () => {

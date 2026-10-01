@@ -1,4 +1,4 @@
--- MCNexus — PostgreSQL schema, version 1. Target: PostgreSQL 14+ (Neon in production, PGlite in tests).
+-- MCNexus — PostgreSQL schema, version 2. Target: PostgreSQL 14+ (Neon in production, PGlite in tests).
 --
 -- Applied by `npm run db:schema` (server/migrate-json-to-pg.js --schema). Idempotent: every statement can be
 -- re-run. Statements end with ';' at the end of a line and contain no other ';' — the Neon HTTP driver runs
@@ -120,3 +120,13 @@ CREATE TABLE IF NOT EXISTS password_reset (
 );
 
 INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING;
+
+-- ---------- version 2: sign-in rate limiting ----------
+-- Failed sign-ins per key ('email:<address>' or 'ip:<address>') in a fixed window that starts at the first failure.
+CREATE TABLE IF NOT EXISTS login_attempt (
+  key           text        PRIMARY KEY,
+  count         integer     NOT NULL,
+  window_start  timestamptz NOT NULL
+);
+
+INSERT INTO schema_version (version) VALUES (2) ON CONFLICT (version) DO NOTHING;

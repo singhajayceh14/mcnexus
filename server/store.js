@@ -21,6 +21,15 @@
 //   getSnapshot(cid, n)                      → snapshot | null
 //   pruneScans(cid, keep) · clearScans(cid)  → number of scans removed (keep <= 0 keeps all)
 //   getTriage(cid) · putTriage(cid, fx)      fx = { [findingId]: { status, owner, notes, … } }
+//   createSession(s)                         s = { hash, email, created, seen, expires, ua, ip }; times in ms;
+//                                            hash = sha256(cookie token) — the raw token is never stored
+//   getSession(hash) · listSessions(email)   → session(s), expired ones included (the caller checks)
+//   touchSession(hash, seen, expires) · deleteSession(hash)
+//   deleteSessions(email, exceptHash)        → number ended
+//   purgeExpired(now)                        drops expired sessions and stale sign-in failure counters
+//   countFailures(key, now, windowMs)        → { count, resetAt }  failed sign-ins in the current window
+//   recordFailure(key, now, windowMs)        → { count, resetAt }  window starts at the first failure
+//   clearFailures(key)
 //   stats()                                  → { connections, scans, users, bytes, location }
 //   close()
 const fs = require('fs'), path = require('path');
@@ -36,7 +45,8 @@ class JsonStore {
     this.dir = dir; this.file = path.join(dir, 'store.json');
     fs.mkdirSync(path.join(dir, 'scans'), { recursive: true });
     const raw = fs.existsSync(this.file) ? JSON.parse(fs.readFileSync(this.file, 'utf8')) : {};
-    this.db = { users: [], connections: [], scans: {}, triage: {}, settings: {}, ...raw };
+    this.db = { users: [], connections: [], scans: {}, triage: {}, settings: {}, sessions: [], ...raw };
+    this.fails = new Map();   // sign-in failures: in memory, as the JSON store is a single process
   }
   _save() { const tmp = this.file + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(this.db, null, 1), { mode: 0o600 }); fs.renameSync(tmp, this.file); }
   _scanPath(cid, n) { return path.join(this.dir, 'scans', cid, n + '.json'); }
@@ -82,6 +92,22 @@ class JsonStore {
 
   async getTriage(cid) { return clone(this.db.triage[cid] || {}); }
   async putTriage(cid, fx) { if (!this._conn(cid)) return false; this.db.triage[cid] = clone(fx || {}); this._save(); return true; }
+
+  async createSession(x) { if (!this.db.users.some(u => u.email === x.email)) return false; this.db.sessions.push(pick(x, ['hash', 'email', 'created', 'seen', 'expires', 'ua', 'ip'])); this._save(); return true; }
+  async getSession(hash) { return clone(this.db.sessions.find(x => x.hash === hash) || null); }
+  async touchSession(hash, seen, expires) { const x = this.db.sessions.find(y => y.hash === hash); if (x) { x.seen = seen; x.expires = expires; this._save(); } }
+  async deleteSession(hash) { const n = this.db.sessions.length; this.db.sessions = this.db.sessions.filter(x => x.hash !== hash); if (this.db.sessions.length === n) return false; this._save(); return true; }
+  async listSessions(email) { return clone(this.db.sessions.filter(x => x.email === email)); }
+  async deleteSessions(email, exceptHash) { const n = this.db.sessions.length; this.db.sessions = this.db.sessions.filter(x => x.email !== email || x.hash === exceptHash); const d = n - this.db.sessions.length; if (d) this._save(); return d; }
+  async purgeExpired(now) {
+    const n = this.db.sessions.length; this.db.sessions = this.db.sessions.filter(x => x.expires > now); const d = n - this.db.sessions.length; if (d) this._save();
+    for (const [k, v] of this.fails) if (v.start < now - 864e5) this.fails.delete(k);
+    return d;
+  }
+
+  async countFailures(key, now, windowMs) { const v = this.fails.get(key); return v && v.start > now - windowMs ? { count: v.count, resetAt: v.start + windowMs } : { count: 0, resetAt: now }; }
+  async recordFailure(key, now, windowMs) { let v = this.fails.get(key); if (!v || v.start <= now - windowMs) v = { count: 0, start: now }; v.count++; this.fails.set(key, v); return { count: v.count, resetAt: v.start + windowMs }; }
+  async clearFailures(key) { this.fails.delete(key); }
 
   async stats() {
     let bytes = 0; const walk = (d) => { try { fs.readdirSync(d, { withFileTypes: true }).forEach(e => { const f = path.join(d, e.name); if (e.isDirectory()) walk(f); else bytes += fs.statSync(f).size; }); } catch { } }; walk(this.dir);

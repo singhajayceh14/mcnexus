@@ -7,7 +7,7 @@
 //   adapter.close()
 const { SETTING_SECTIONS, CONN_KEYS, checkKeys } = require('./store');
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const FIRST_OWNER_LOCK = 7243100;   // pg_advisory_xact_lock key: serialises concurrent first sign-ins
 
 // connection object key → [column, kind]
@@ -24,6 +24,9 @@ function rowToConn(r) {
   for (const [k, [col, kind]] of Object.entries(CONN_COLS)) { const v = r[col]; if (v == null) continue; c[k] = kind === 'ts' ? iso(v) : v; }
   return c;
 }
+const ms = (v) => new Date(v).getTime();
+const rowToSession = (r) => ({ hash: r.token_hash, email: r.email, created: ms(r.created_at), seen: ms(r.last_seen), expires: ms(r.expires_at), ua: r.user_agent || '', ip: r.ip || '' });
+const SESSION_SELECT = 'SELECT s.*, u.email FROM app_session s JOIN app_user u ON u.id = s.user_id';
 const rowToUser = (r) => ({ email: r.email, name: r.name, role: r.role, salt: r.pw_salt, hash: r.pw_hash });
 
 class PgStore {
@@ -101,6 +104,42 @@ class PgStore {
     ]);
     return ok.length === 1;
   }
+
+  // ---------- sessions (keyed by sha256 of the cookie token; times in ms) ----------
+  async createSession(x) {
+    const r = await this.db.query('INSERT INTO app_session (token_hash, user_id, created_at, last_seen, expires_at, user_agent, ip) SELECT $1, id, $3, $4, $5, $6, $7 FROM app_user WHERE email = $2 RETURNING token_hash',
+      [x.hash, x.email, new Date(x.created), new Date(x.seen), new Date(x.expires), x.ua || null, x.ip || null]);
+    return r.length === 1;
+  }
+  async getSession(hash) { const r = await this.db.query(SESSION_SELECT + ' WHERE s.token_hash = $1', [hash]); return r[0] ? rowToSession(r[0]) : null; }
+  async touchSession(hash, seen, expires) { await this.db.query('UPDATE app_session SET last_seen = $2, expires_at = $3 WHERE token_hash = $1', [hash, new Date(seen), new Date(expires)]); }
+  async deleteSession(hash) { return (await this.db.query('DELETE FROM app_session WHERE token_hash = $1 RETURNING token_hash', [hash])).length === 1; }
+  async listSessions(email) { return (await this.db.query(SESSION_SELECT + ' WHERE u.email = $1 ORDER BY s.created_at, s.token_hash', [email])).map(rowToSession); }
+  async deleteSessions(email, exceptHash) {
+    return (await this.db.query('DELETE FROM app_session s USING app_user u WHERE s.user_id = u.id AND u.email = $1 AND s.token_hash <> $2 RETURNING s.token_hash', [email, exceptHash || ''])).length;
+  }
+  async purgeExpired(now) {
+    const [s] = await this.db.tx([
+      ['DELETE FROM app_session WHERE expires_at <= $1 RETURNING token_hash', [new Date(now)]],
+      ['DELETE FROM login_attempt WHERE window_start < $1', [new Date(now - 864e5)]],
+    ]);
+    return s.length;
+  }
+
+  // ---------- failed sign-ins: fixed window from the first failure ----------
+  async countFailures(key, now, windowMs) {
+    const r = await this.db.query('SELECT count, window_start FROM login_attempt WHERE key = $1 AND window_start > $2', [key, new Date(now - windowMs)]);
+    return r[0] ? { count: r[0].count, resetAt: ms(r[0].window_start) + windowMs } : { count: 0, resetAt: now };
+  }
+  async recordFailure(key, now, windowMs) {
+    const r = await this.db.query(`INSERT INTO login_attempt (key, count, window_start) VALUES ($1, 1, $2)
+      ON CONFLICT (key) DO UPDATE SET
+        count = CASE WHEN login_attempt.window_start <= $3 THEN 1 ELSE login_attempt.count + 1 END,
+        window_start = CASE WHEN login_attempt.window_start <= $3 THEN $2 ELSE login_attempt.window_start END
+      RETURNING count, window_start`, [key, new Date(now), new Date(now - windowMs)]);
+    return { count: r[0].count, resetAt: ms(r[0].window_start) + windowMs };
+  }
+  async clearFailures(key) { await this.db.query('DELETE FROM login_attempt WHERE key = $1', [key]); }
 
   async stats() {
     const r = (await this.db.query('SELECT (SELECT count(*) FROM connection)::int AS c, (SELECT count(*) FROM scan)::int AS s, (SELECT count(*) FROM app_user)::int AS u, pg_database_size(current_database())::bigint AS b', []))[0];
