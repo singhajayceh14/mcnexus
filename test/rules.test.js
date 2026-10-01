@@ -192,6 +192,24 @@ describe('clean org', () => {
   test('health is 100 with no findings', () => assert.equal(ds.summary.health, 100));
 });
 
+describe('analyzeParts (what the analysis worker runs)', () => {
+  test('packed parts give exactly what analyze() gives on the merged model', () => {
+    const { analyzeParts, packPart, emptyM } = require('../server/analyze');
+    const org = () => Object.assign(dirtyOrg(), { deDone: [ENT] });   // real scans always record which BUs' DEs were collected
+    const whole = run(org(), { naming: DIRTY_NAMING }).ds;
+    // split the org into two parts, as two scan steps would
+    const M = org(), a = emptyM(), b = emptyM();
+    for (const k of Object.keys(a)) { if (Array.isArray(M[k])) { a[k] = M[k].slice(0, 1); b[k] = M[k].slice(1); } else a[k] = M[k]; }
+    const cov = {}; MODULES.forEach(m => cov[m] = { ok: 1, fail: 0, notes: [] });
+    const r = analyzeParts([packPart(a), null, packPart(b)], { bus: [BU], allBus: [BU], entMid: ENT, mods: new Set(MODULES), cov, naming: DIRTY_NAMING, rulesX: {}, counts: { assets: 7 } });
+    assert.deepEqual(r.ds.findings.map(f => f.id).sort(), whole.findings.map(f => f.id).sort());
+    assert.deepEqual(r.ds.summary, whole.summary);
+    assert.ok(r.log.some(l => /Dependency graph built/.test(l)), 'log lines returned');
+    assert.equal(r.counts.assets, 7, 'existing counts kept');
+    assert.equal(r.counts.findings, whole.findings.length);
+  });
+});
+
 describe('gating and overrides', () => {
   test('rules only run for selected modules', () => {
     const { rules } = run(dirtyOrg(), { mods: ['Data'], naming: DIRTY_NAMING });

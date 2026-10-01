@@ -197,6 +197,7 @@ test('poll mode: one step per poll, overlapping polls never repeat a step, resul
     assert.ok(done, 'finished');
     assert.equal(done.error, null);
     assert.equal(done.pct, 100);
+    assert.ok(done.log.some(l => /Dependency graph built/.test(l.m)), 'analysis (in a worker) logs into the job');
     for (const k of ['plan', 'tok', 'opts', 'cov', 'org', 'cursor']) assert.ok(!(k in done), 'job response exposes ' + k);
     const [a, b] = await lastTwo();
     assert.deepEqual(await inventory(b.id), await inventory(a.id), 'no duplicated data');
@@ -206,6 +207,30 @@ test('poll mode: one step per poll, overlapping polls never repeat a step, resul
     assert.deepEqual(await findingIds(b.id), await findingIds(a.id));
     assert.equal(await ctx.store.getJobPart(id, 0), null, 'parts deleted when the job ends');
   } finally { srv.setScanMode('background'); }
+});
+
+test('the connections list reports a running scan until it ends', async () => {
+  srv.setScanMode('poll');
+  try {
+    const { jobId, scanId } = (await call('POST', '/api/scans', { connId: state.cid })).json;
+    await call('GET', '/api/jobs/' + jobId);
+    const run = (await call('GET', '/api/connections')).json.connections.find(c => c.id === state.cid).running;
+    assert.equal(run.jobId, jobId); assert.equal(run.scanId, scanId); assert.ok(run.pct > 0);
+    await call('POST', '/api/jobs/' + jobId + '/cancel');
+    assert.equal((await call('GET', '/api/connections')).json.connections.find(c => c.id === state.cid).running, null);
+  } finally { srv.setScanMode('background'); }
+});
+
+test('at startup the server resumes stored scans on its own (no requests needed)', async () => {
+  srv.setScanMode('poll');
+  const id = (await call('POST', '/api/scans', { connId: state.cid })).json.jobId;
+  await call('GET', '/api/jobs/' + id);
+  ctx.store = ctx.reopen(); srv.useStore(ctx.store); srv.setScanMode('background');   // "restart"
+  assert.equal(await srv.resumeRunningJobs(), 1);
+  let j; for (let i = 0; i < 200 && !(j && j.status !== 'running'); i++) { await new Promise(ok => setTimeout(ok, 25)); j = await ctx.store.getJob(id); }
+  assert.equal(j.status, 'done', JSON.stringify(j.state.error));
+  const [a, b] = await lastTwo();
+  assert.deepEqual(await findingIds(b.id), await findingIds(a.id));
 });
 
 test('cancel ends a job at the next step and frees the connection', async () => {

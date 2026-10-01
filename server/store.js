@@ -35,6 +35,7 @@
 //   claimJob(id, now, leaseMs)               → job | null — only a running job whose lease is free; takes the lease
 //   saveJob(id, state, status, now)          status 'running' | 'done' | 'failed'; releases the lease
 //   requestCancel(id)                        → true if the job was running
+//   listRunningJobs()                        → [{ id, connId, scanId, pct }]
 //   putJobPart(id, seq, data) · getJobPart(id, seq) · deleteJobParts(id)   data: opaque string (gzip+base64)
 //   stats()                                  → { connections, scans, users, bytes, location }
 //   close()
@@ -128,6 +129,7 @@ class JsonStore {
   async getJob(id) { const j = this._job(id); return j ? this._pubJob(j) : null; }
   async claimJob(id, now, leaseMs) { const j = this._job(id); if (!j || j.status !== 'running' || j.lease > now) return null; j.lease = now + leaseMs; this._save(); return this._pubJob(j); }
   async saveJob(id, state, status, now) { const j = this._job(id); if (!j) return false; Object.assign(j, { state: clone(state), status, lease: 0, updated: now }); this._save(); return true; }
+  async listRunningJobs() { return this.db.jobs.filter(j => j.status === 'running').map(j => ({ id: j.id, connId: j.connId, scanId: j.state.scanId, pct: j.state.pct })); }
   async requestCancel(id) { const j = this._job(id); if (!j || j.status !== 'running') return false; j.cancel = true; this._save(); return true; }
   async putJobPart(id, seq, data) { fs.mkdirSync(this._partDir(id), { recursive: true }); fs.writeFileSync(path.join(this._partDir(id), seq + '.txt'), data); }
   async getJobPart(id, seq) { try { return fs.readFileSync(path.join(this._partDir(id), seq + '.txt'), 'utf8'); } catch { return null; } }

@@ -124,9 +124,10 @@ function contract(name, make) {
     });
 
     test('jobs: one running per connection, leases, cancel, parts, purge', async () => {
-      const t = 1_800_000_000_000, st = (k) => ({ zeta: 1, mods: { Security: 'QUEUED', Data: 'QUEUED' }, at: k, log: [{ t: '00:00', m: 'x' }] });
+      const t = 1_800_000_000_000, st = (k) => ({ zeta: 1, scanId: '#007', pct: 10 * k, mods: { Security: 'QUEUED', Data: 'QUEUED' }, at: k, log: [{ t: '00:00', m: 'x' }] });
       assert.deepEqual(await store.createJob({ id: 'j1', connId: 'c1', state: st(0), now: t }), { ok: true });
       assert.deepEqual(await store.createJob({ id: 'j2', connId: 'c1', state: st(0), now: t }), { ok: false, running: 'j1' });
+      assert.deepEqual(await store.listRunningJobs(), [{ id: 'j1', connId: 'c1', scanId: undefined, pct: undefined }].map(j => ({ ...j, scanId: st(0).scanId, pct: st(0).pct })));
       assert.deepEqual(await store.getJob('j1'), { id: 'j1', connId: 'c1', status: 'running', state: st(0), cancel: false, leaseUntil: null });
       assert.equal(JSON.stringify((await store.getJob('j1')).state), JSON.stringify(st(0)), 'state key order kept');
       assert.equal(await store.getJob('nope'), null);
@@ -147,6 +148,7 @@ function contract(name, make) {
       await store.saveJob('j1', st(2), 'failed', t + 3000);
       assert.equal(await store.claimJob('j1', t + 999e6, 60e3), null, 'finished jobs are not claimable');
       assert.equal(await store.requestCancel('j1'), false);
+      assert.deepEqual(await store.listRunningJobs(), [], 'finished jobs are not listed');
       assert.deepEqual(await store.createJob({ id: 'j2', connId: 'c1', state: st(0), now: t }), { ok: true }, 'new job once the old one ended');
       await store.saveJob('j2', st(9), 'done', t + 4000);
       await store.deleteJobParts('j1');

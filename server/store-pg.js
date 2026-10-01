@@ -159,6 +159,10 @@ class PgStore {
   async saveJob(id, state, status, now) {
     return (await this.db.query('UPDATE scan_job SET state = $2::json, status = $3, lease_until = NULL, updated_at = $4 WHERE id = $1 RETURNING id', [id, JSON.stringify(state), status, new Date(now)])).length === 1;
   }
+  async listRunningJobs() {
+    return (await this.db.query("SELECT id, conn_id, state->>'scanId' AS scan_id, (state->>'pct')::int AS pct FROM scan_job WHERE status = 'running' ORDER BY created_at", []))
+      .map(r => ({ id: r.id, connId: r.conn_id, scanId: r.scan_id, pct: r.pct }));
+  }
   async requestCancel(id) { return (await this.db.query("UPDATE scan_job SET cancel_requested = true WHERE id = $1 AND status = 'running' RETURNING id", [id])).length === 1; }
   async putJobPart(id, seq, data) { await this.db.query('INSERT INTO scan_job_part (job_id, seq, data) VALUES ($1, $2, $3) ON CONFLICT (job_id, seq) DO UPDATE SET data = excluded.data', [id, seq, data]); }
   // One part per query: the Neon HTTP driver caps request/response size, and parts can be megabytes each.

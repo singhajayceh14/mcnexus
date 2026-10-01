@@ -2,6 +2,7 @@
 // MCNexus server (Node 22+). Serves the app and proxies read-only SFMC API calls. Storage: server/store.js.
 'use strict';
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto'), zlib = require('zlib');
+const { Worker } = require('worker_threads');
 const { createStore } = require('./store');
 const { RULESET, arr, dig, fmtD, ageDays, hid, plural, bool, RULES, RULE, DOMAIN_OF, DOMAINS, MODULES, SEVS, W, PEN, score, AUTO_STATUS, ACT_TYPE, CONTENT_TYPES, PAGE_TYPES, SECRET_RE, sqlSources, sqlDepth, patternRe, analyze, emptyM, mergeM, packPart, unpackPart, hasData, analyzeParts } = require('./analyze');
 
@@ -381,14 +382,30 @@ const STEPS = {
   },
 };
 
-function finishScan(st, x, M) {
-  const { mods, L, mark, setMod } = x;
+// Module statuses before analysis; Governance after.
+function beginAnalysis(st, x) {
+  const { mods, setMod } = x;
   ['Security', 'Data', 'SQL', 'Automation', 'Journey', 'Content', 'CloudPages'].forEach(m => { if (!mods.has(m)) return; const c = st.cov[m]; setMod(m, !c.ok ? 'FAILED' : c.fail ? 'PARTIAL' : 'SUCCESS'); });
   st.cur = 'Analysis'; setMod('Governance', mods.has('Governance') ? 'RUNNING' : 'SKIPPED');
   const { bus, allBus, entMid } = st.org;
-  const ds = analyze(M, { bus, allBus, entMid, mods, cov: st.cov, naming: st.opts.naming, rulesX: st.opts.rulesX || {}, L, job: st });
-  if (mods.has('Governance')) { mark('Governance', true); setMod('Governance', 'SUCCESS'); }
-  return ds;
+  return { bus, allBus, entMid, mods, cov: st.cov, naming: st.opts.naming, rulesX: st.opts.rulesX || {} };
+}
+function endAnalysis(st, x) { if (x.mods.has('Governance')) { x.mark('Governance', true); x.setMod('Governance', 'SUCCESS'); } }
+function finishScan(st, x, M) { const o = beginAnalysis(st, x); const ds = analyze(M, { ...o, L: x.L, job: st }); endAnalysis(st, x); return ds; }
+
+// Analyses stored parts in a worker thread (falls back to this thread if a worker can't start).
+function analyzeInWorker(parts, o) {
+  return new Promise((resolve, reject) => {
+    let w; try { w = new Worker(path.join(__dirname, 'analyze-worker.js'), { workerData: { parts, o } }); } catch (e) { console.error('Analysis worker unavailable, analysing inline:', e.message); return resolve(analyzeParts(parts, o)); }
+    w.once('message', (r) => r.ok ? resolve(r) : reject(new Error('Analysis failed — ' + r.error)));
+    w.once('error', reject);
+    w.once('exit', (code) => { if (code !== 0) reject(new Error('Analysis worker stopped (exit code ' + code + ')')); });
+  });
+}
+async function finishScanParts(st, x, parts) {
+  const r = await analyzeInWorker(parts, { ...beginAnalysis(st, x), counts: st.counts });
+  r.log.forEach(x.L); Object.assign(st.counts, r.counts);
+  endAnalysis(st, x); return r.ds;
 }
 
 // Whole scan in memory with one SFMC client. Throws on a fatal error, like a failed job.
@@ -430,8 +447,8 @@ async function runStep(jobId) {
     applyLimits(st.opts.limits);
     const x = stepCtx(st, conn), step = st.plan[st.at];
     if (step.k === 'analyze') {
-      const M = emptyM(); for (let i = 0; i < st.parts; i++) { const p = await store.getJobPart(jobId, i); if (p) mergeM(M, unpackPart(p)); }
-      await saveScanResult(st, finishScan(st, x, M), log);
+      const parts = []; for (let i = 0; i < st.parts; i++) parts.push(await store.getJobPart(jobId, i));   // still compressed
+      await saveScanResult(st, await finishScanParts(st, x, parts), log);
     } else {
       const r = await STEPS[step.k](st, x, step, st.cursor);
       st.calls += x.api.calls; st.tok = enc(JSON.stringify(x.api.tokens));
@@ -455,8 +472,20 @@ async function runStep(jobId) {
 const driving = new Set();
 function kick(jobId) {
   if (driving.has(jobId)) return; driving.add(jobId);
-  (async () => { try { for (;;) { const st = await runStep(jobId); if (!st || st.done) break; } } catch (e) { console.error('Scan ' + jobId + ':', e); } finally { driving.delete(jobId); } })();
+  (async () => {
+    try {
+      for (;;) {
+        const st = await runStep(jobId); if (st && !st.done) continue; if (st) break;
+        // Not claimable: finished, or a lease is held (e.g. by a process that died). Retry when the lease lapses.
+        const j = await store.getJob(jobId);
+        if (j && j.status === 'running') setTimeout(() => kick(jobId), Math.max(1000, (j.leaseUntil || 0) - Date.now() + 500)).unref();
+        break;
+      }
+    } catch (e) { console.error('Scan ' + jobId + ':', e); } finally { driving.delete(jobId); }
+  })();
 }
+// Background mode: pick up jobs that were running when the server last stopped.
+async function resumeRunningJobs() { if (SCAN_POLL) return 0; const js = await store.listRunningJobs(); js.forEach(j => kick(j.id)); return js.length; }
 const pubJob = (j) => { const s = j.state; return { connId: s.connId, scanId: s.scanId, n: s.n, pct: s.pct, cur: s.cur, mods: s.mods, counts: s.counts, done: s.done, error: s.error, cancelled: !!(j.cancel || s.cancelled), partial: s.partial, log: s.log.slice(0, 60), elapsed: elapsed(s.t0) }; };
 
 // ---------- HTTP ----------
@@ -491,12 +520,13 @@ async function startSession(req, email) {
 const subOk = (s) => /^[a-z0-9-]{10,60}$/.test(s || '');
 const parseSub = (v) => { const t = String(v || '').trim().toLowerCase(); const m = t.match(/^https?:\/\/([a-z0-9-]+)\.(auth|rest|soap)\.marketingcloudapis\.com/); return m ? m[1] : t.replace(/[^a-z0-9-]/g, ''); };
 
-function publicConn(c, list = []) {
+function publicConn(c, list = [], run = null) {
   const last = list[list.length - 1];
   return { id: c.id, name: c.name, env: c.env, mid: c.mid || '—', sub: c.sub, bus: (c.buList || []).filter(b => !(c.buOff || {})[b.mid]).length || (c.buList || []).length, buList: c.buList || [], buOff: c.buOff || {}, status: c.status || 'Connected', validated: c.validated || '—', access: c.access || [], scopes: c.scopes || [], cidHint: c.cid ? c.cid.slice(0, 4) + '…' + c.cid.slice(-4) : '—', secretUpdated: c.secretUpdated ? fmtD(c.secretUpdated) : (c.created ? fmtD(c.created) : '—'),
-    health: last ? last.health : 0, coverage: last ? last.cov : 0, last: last ? last.date : 'Never', scan: last ? last.id : '—', crit: last ? last.sev[0] : 0, high: last ? last.sev[1] : 0, scans: list.length };
+    health: last ? last.health : 0, coverage: last ? last.cov : 0, last: last ? last.date : 'Never', scan: last ? last.id : '—', crit: last ? last.sev[0] : 0, high: last ? last.sev[1] : 0, scans: list.length,
+    running: run ? { jobId: run.id, scanId: run.scanId, pct: run.pct } : null };
 }
-const pubConn = async (c) => publicConn(c, await store.listScans(c.id));
+const pubConn = async (c, runs) => publicConn(c, await store.listScans(c.id), (runs || await store.listRunningJobs()).find(j => j.connId === c.id));
 const stamp = () => fmtD(new Date()) + ' ' + new Date().toTimeString().slice(0, 5);
 const pwOk = (u, pw) => crypto.timingSafeEqual(Buffer.from(hashPw(pw, u.salt), 'hex'), Buffer.from(u.hash, 'hex'));
 // Unknown emails still pay for one scrypt, so response time doesn't reveal which accounts exist.
@@ -557,7 +587,7 @@ async function api(req, res, url) {
     const st = await store.stats(), up = Math.floor((Date.now() - STARTED) / 1000), size = st.bytes;
     return send(req, res, 200, { version: VERSION, ruleset: RULESET, node: process.version, platform: process.platform + ' ' + process.arch, started: new Date(STARTED).toISOString(), uptime: Math.floor(up / 86400) + 'd ' + Math.floor(up % 86400 / 3600) + 'h ' + Math.floor(up % 3600 / 60) + 'm', storage: PG ? 'PostgreSQL' : 'JSON files', dataDir: st.location, dataSize: size > 1e6 ? (size / 1e6).toFixed(1) + ' MB' : Math.ceil(size / 1e3) + ' KB', connections: st.connections, scans: st.scans, users: st.users, keySource: process.env.MCNEXUS_KEY ? 'MCNEXUS_KEY environment variable' : 'server/data/.key (generated)', listen: HOST + ':' + PORT });
   }
-  if (p === '/api/connections' && m === 'GET') return send(req, res, 200, { connections: await Promise.all((await store.listConnections()).map(pubConn)) });
+  if (p === '/api/connections' && m === 'GET') { const runs = await store.listRunningJobs(); return send(req, res, 200, { connections: await Promise.all((await store.listConnections()).map(c => pubConn(c, runs))) }); }
   if (p === '/api/connections/test' && m === 'POST') {
     const b = await readBody(req); const sub = parseSub(b.sub); let sec = b.sec;
     if (!sec && b.reauth) { const c = await store.getConnection(b.reauth); if (c) sec = dec(c.secEnc); }
@@ -675,8 +705,14 @@ async function handle(req, res) {
   catch (e) { console.error(e); send(req, res, e.status && e.status < 500 ? 400 : 500, { error: e.message }); }
 }
 
-if (require.main === module) http.createServer(handle).listen(PORT, HOST, () => console.log(`MCNexus ${VERSION} → http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}/  (storage: ${PG ? 'PostgreSQL' : DATA})`));
+if (require.main === module) {
+  http.createServer(handle).listen(PORT, HOST, () => {
+    console.log(`MCNexus ${VERSION} → http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}/  (storage: ${PG ? 'PostgreSQL' : DATA})`);
+    // Background mode: carry on with scans that were running when the server last stopped.
+    ready().then(resumeRunningJobs).then(n => { if (n) console.log('Resuming ' + plural(n, 'scan')); }).catch(e => console.error('Could not resume scans:', e.message));
+  });
+}
 
 // Internals exported for tests (test/). Set MCNEXUS_DATA / MCNEXUS_KEY before requiring: the store loads on require.
-module.exports = { handle, useStore, withDefaults, SESSION_IDLE, SESSION_MAX, setScanMode, runStep, STEP_LEASE, packPart, unpackPart, analyze, runScan, testConnection, SFMC, ApiErr, xmlObj, sqlSources, sqlDepth, patternRe, enc, dec, hid, score,
+module.exports = { handle, useStore, withDefaults, SESSION_IDLE, SESSION_MAX, setScanMode, runStep, resumeRunningJobs, STEP_LEASE, packPart, unpackPart, analyze, runScan, testConnection, SFMC, ApiErr, xmlObj, sqlSources, sqlDepth, patternRe, enc, dec, hid, score,
   RULES, RULE, RULESET, VERSION, DOMAINS, DOMAIN_OF, MODULES, SEVS, W, PEN, SECRET_RE, STATIC_OK };
