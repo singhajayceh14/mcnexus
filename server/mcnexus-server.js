@@ -269,147 +269,263 @@ function sqlDepth(text) {
 }
 const patternRe = (p) => new RegExp('^' + p.split(/(<[A-Z_]+>)/).map((x, i, a) => /^<[A-Z_]+>$/.test(x) ? (i === a.length - 2 ? '[A-Za-z0-9_\\-]+' : '[A-Za-z0-9]+') : x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('') + '$');
 
-// ---------- scan ----------
-const jobs = {};
+// ---------- scan: resumable steps ----------
+// A scan is a job in the store, worked through in short steps so it survives restarts and fits short-lived
+// serverless functions. Plan: org → security → per BU: bu (token check), data, sql, automation, journey, content
+// (paged over several steps) → analyze. Each collecting step saves what it found as a gzipped part of the raw
+// model; the analyze step merges the parts and runs analyze().
+//   runStep(jobId)  advances a stored job by one step (holds a lease so no two workers run the same step)
+//   runScan(...)    runs a whole scan in memory, no store (tests)
+// Drivers: locally a background loop per job (kick); on Vercel (or MCNEXUS_SCAN_MODE=poll) each progress poll
+// runs at most one step, so no request outlives a function.
 const elapsed = (t0) => { const s = Math.floor((Date.now() - t0) / 1000); return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0'); };
+const STEP_LEASE = 10 * 60e3, CONTENT_PAGES_PER_STEP = 2;
+let SCAN_POLL = process.env.MCNEXUS_SCAN_MODE === 'poll' || (!!process.env.VERCEL && process.env.MCNEXUS_SCAN_MODE !== 'background');
+const setScanMode = (m) => { SCAN_POLL = m === 'poll'; };   // tests
+const BU_STEPS = [['Data', 'data'], ['SQL', 'sql'], ['Automation', 'automation'], ['Journey', 'journey']];
+const BU_MODS = ['Data', 'SQL', 'Automation', 'Journey', 'Content', 'CloudPages'];
+const emptyM = () => ({ des: [], fields: {}, folders: {}, queries: [], autos: [], imports: [], scripts: [], journeys: [], evs: [], content: [], users: [], deDone: [] });
+const mergeM = (into, p) => { for (const k of Object.keys(into)) { if (Array.isArray(into[k])) into[k].push(...(p[k] || [])); else Object.assign(into[k], p[k] || {}); } return into; };
+const hasData = (p) => Object.values(p).some(v => Array.isArray(v) ? v.length : Object.keys(v).length);
+const packPart = (p) => zlib.gzipSync(JSON.stringify(p)).toString('base64');
+const unpackPart = (s) => JSON.parse(zlib.gunzipSync(Buffer.from(s, 'base64')).toString('utf8'));
 
-async function runScan(job, conn, opts) {
-  const api = new SFMC({ sub: conn.sub, cid: conn.cid, sec: dec(conn.secEnc) });
-  const L = (m) => { job.log.unshift({ t: elapsed(job.t0), m }); if (job.log.length > 300) job.log.pop(); };
-  const mods = new Set(opts.modules && opts.modules.length ? opts.modules : MODULES);
-  const cov = {}; MODULES.forEach(m => cov[m] = { ok: 0, fail: 0, notes: [] });
-  const mark = (m, ok, note) => { const c = cov[m]; ok ? c.ok++ : c.fail++; if (note && c.notes.length < 4 && !c.notes.includes(note)) c.notes.push(note); if (!ok) job.counts.warnings++; };
-  const setMod = (m, st) => { job.mods[m] = st; };
-  const check = () => { if (job.cancelled) throw new ApiErr('Cancelled by user', 0, 'cancel'); };
-  const capped = (m, label, list) => { if (list && list.truncated) { mark(m, false, label + ': page limit reached (' + MAX_PAGES + ' pages)'); L(label + ': stopped at the page limit, results incomplete'); } return list; };
-  MODULES.forEach(m => job.mods[m] = mods.has(m) ? 'QUEUED' : 'SKIPPED');
-  const M = { des: [], fields: {}, folders: {}, queries: [], autos: [], imports: [], scripts: [], journeys: [], evs: [], content: [], users: [], deDone: [] };
-
-  // Organization
-  job.cur = 'Organization'; setMod('Organization', 'RUNNING');
-  const t = await api.token(conn.mid || null); L('Token issued · ' + scopeList(t.scope).length + ' scopes');
-  const disc = await discoverBus(api, conn.mid || null);
-  const entMid = disc.entId || (disc.bus[0] && disc.bus[0].mid);
-  mark('Organization', !disc.err, disc.err && ('BU discovery: ' + disc.err.message)); capped('Organization', 'BU discovery', disc.truncated && { truncated: true });
-  const allBus = disc.bus; const wanted = new Set((opts.mids && opts.mids.length ? opts.mids : allBus.map(b => b.mid)).map(String));
-  const bus = allBus.filter(b => wanted.has(b.mid));
-  L('Discovered ' + plural(allBus.length, 'Business Unit') + (entMid ? ' under Enterprise ' + entMid : '') + ' · scanning ' + bus.length);
-  setMod('Organization', disc.err || disc.truncated ? 'PARTIAL' : 'SUCCESS');
-  const totalSteps = bus.length * 6 + 3; let done = 1;
-  const tick = () => { done++; job.pct = Math.min(97, Math.round(done / totalSteps * 100)); };
-  tick();
-
-  if (mods.has('Security')) {
-    job.cur = 'Security'; setMod('Security', 'RUNNING');
-    try { M.users = capped('Security', 'Users', await api.retrieveSafe(conn.mid || null, 'AccountUser', ['ID', 'UserID', 'Name', 'Email', 'ActiveFlag', 'IsAPIUser', 'LastSuccessfulLogin', 'CreatedDate', 'Client.ID'], ['ID', 'UserID', 'Name', 'ActiveFlag', 'LastSuccessfulLogin'], { all: true })); mark('Security', true); L('Collected ' + plural(M.users.length, 'user') + ' (SOAP AccountUser)'); }
-    catch (e) { mark('Security', false, 'Users: ' + e.message); L('Users unavailable — ' + e.message); }
-  }
-  tick();
-
-  for (const bu of bus) {
-    check();
-    const mid = bu.mid, B = bu.name;
-    try { await api.token(mid); } catch (e) { L(B + ': no access for this package — ' + e.message); ['Data', 'SQL', 'Automation', 'Journey', 'Content', 'CloudPages'].forEach(m => mods.has(m) && mark(m, false, B + ': ' + e.message)); done += 6; job.pct = Math.min(97, Math.round(done / totalSteps * 100)); continue; }
-    const tag = (o) => Object.assign(o, { mid, bu: B });
-
-    if (mods.has('Data')) {
-      job.cur = 'Data · ' + B; setMod('Data', 'RUNNING');
-      try {
-        const des = capped('Data', B + ' DEs', await api.retrieveSafe(mid, 'DataExtension', ['ObjectID', 'CustomerKey', 'Name', 'IsSendable', 'CategoryID', 'CreatedDate', 'ModifiedDate', 'DataRetentionPeriodLength', 'DataRetentionPeriod', 'RowBasedRetention', 'RetainUntil', 'DeleteAtEndOfRetentionPeriod', 'Description', 'SendableDataExtensionField.Name', 'SendableSubscriberField.Name'], ['ObjectID', 'CustomerKey', 'Name', 'IsSendable', 'CategoryID', 'CreatedDate', 'ModifiedDate']));
-        des.forEach(d => M.des.push(tag({ objectId: d.ObjectID, ck: d.CustomerKey, name: d.Name, sendable: bool(d.IsSendable), categoryId: d.CategoryID, created: d.CreatedDate, modified: d.ModifiedDate, retLen: d.DataRetentionPeriodLength, retPeriod: d.DataRetentionPeriod, rowRet: bool(d.RowBasedRetention), retainUntil: d.RetainUntil, deleteAtEnd: bool(d.DeleteAtEndOfRetentionPeriod), retKnown: d.DataRetentionPeriodLength !== undefined || d.RowBasedRetention !== undefined, desc: d.Description, sendField: dig(d, 'SendableDataExtensionField', 'Name'), subField: dig(d, 'SendableSubscriberField', 'Name') })));
-        L(B + ': ' + plural(des.length, 'Data Extension') + ' (SOAP)'); job.counts.assets += des.length; mark('Data', true); if (!des.truncated) M.deDone.push(mid);
-        try {
-          const fs_ = capped('Data', B + ' DE fields', await api.retrieveSafe(mid, 'DataExtensionField', ['Name', 'IsPrimaryKey', 'FieldType', 'IsRequired', 'DataExtension.CustomerKey'], ['Name', 'IsPrimaryKey', 'DataExtension.CustomerKey']));
-          // A cut-off field list can end mid-DE; leave fields uncollected rather than report a false "no primary key".
-          if (!fs_.truncated) fs_.forEach(f => { const k = mid + '|' + dig(f, 'DataExtension', 'CustomerKey'); (M.fields[k] = M.fields[k] || []).push({ name: f.Name, pk: bool(f.IsPrimaryKey), type: f.FieldType }); });
-          L(B + ': ' + fs_.length.toLocaleString('en-US') + ' DE fields');
-        } catch (e) { mark('Data', false, B + ' fields: ' + e.message); }
-        try { const fo = await api.retrieve(mid, 'DataFolder', ['ID', 'Name', 'ParentFolder.ID', 'ContentType']); fo.forEach(f => { M.folders[mid + '|' + f.ID] = { name: f.Name, parent: dig(f, 'ParentFolder', 'ID') }; }); } catch { }
-      } catch (e) { mark('Data', false, B + ': ' + e.message); L(B + ': Data Extensions failed — ' + e.message); }
-    }
-    tick(); check();
-
-    if (mods.has('SQL')) {
-      job.cur = 'SQL · ' + B; setMod('SQL', 'RUNNING');
-      try {
-        const qs = capped('SQL', B + ' queries', await api.retrieveSafe(mid, 'QueryDefinition', ['ObjectID', 'CustomerKey', 'Name', 'QueryText', 'TargetType', 'DataExtensionTarget.Name', 'DataExtensionTarget.CustomerKey', 'TargetUpdateType', 'CreatedDate', 'ModifiedDate', 'CategoryID'], ['ObjectID', 'CustomerKey', 'Name', 'QueryText', 'DataExtensionTarget.Name', 'DataExtensionTarget.CustomerKey', 'TargetUpdateType', 'CreatedDate', 'ModifiedDate']));
-        qs.forEach(q => M.queries.push(tag({ objectId: q.ObjectID, ck: q.CustomerKey, name: q.Name, text: q.QueryText || '', targetName: dig(q, 'DataExtensionTarget', 'Name'), targetCk: dig(q, 'DataExtensionTarget', 'CustomerKey'), update: q.TargetUpdateType, created: q.CreatedDate, modified: q.ModifiedDate })));
-        L(B + ': ' + plural(qs.length, 'SQL Query') + ' (SOAP)'); job.counts.assets += qs.length; mark('SQL', true);
-      } catch (e) { mark('SQL', false, B + ': ' + e.message); L(B + ': SQL failed — ' + e.message); }
-    }
-    tick(); check();
-
-    if (mods.has('Automation')) {
-      job.cur = 'Automation · ' + B; setMod('Automation', 'RUNNING');
-      try {
-        const list = capped('Automation', B + ' automations', await api.restPages(mid, '/automation/v1/automations', { size: 200 }));
-        const det = await pMap(list.slice(0, MAX_DETAIL), CONCURRENCY, a => api.rest(mid, 'GET', '/automation/v1/automations/' + a.id).catch(() => a));
-        det.concat(list.slice(MAX_DETAIL)).forEach(a => {
-          const sid = a.statusId != null ? a.statusId : a.status;
-          const status = typeof a.status === 'string' && isNaN(+a.status) ? a.status : (AUTO_STATUS[sid] || 'Unknown');
-          const steps = arr(a.steps).flatMap(s => arr(s.activities).map(x => ({ name: x.name, typeId: x.objectTypeId, objectId: x.activityObjectId, step: s.step || s.stepNumber })));
-          M.autos.push(tag({ id: a.id, key: a.key || a.customerKey, name: a.name, status, lastRun: a.lastRunTime, lastRunStatus: a.lastRunStatus, schedule: a.schedule, steps, created: a.createdDate, modified: a.modifiedDate || a.lastSavedDate, detailed: !!a.steps }));
-        });
-        if (list.length > MAX_DETAIL) mark('Automation', false, B + ': detail limited to ' + MAX_DETAIL + ' automations');
-        L(B + ': ' + plural(list.length, 'Automation') + ' · ' + M.autos.filter(a => a.mid === mid).reduce((n, a) => n + a.steps.length, 0) + ' activities (REST)'); job.counts.assets += list.length; mark('Automation', true);
-      } catch (e) { mark('Automation', false, B + ': ' + e.message); L(B + ': Automations failed — ' + e.message); }
-      try { const im = capped('Automation', B + ' imports', await api.restPages(mid, '/automation/v1/imports', { size: 200 })); im.forEach(i => M.imports.push(tag({ id: i.importDefinitionId || i.id, name: i.name, ck: i.customerKey, destId: i.destinationObjectId, destName: i.destinationName, modified: i.modifiedDate }))); job.counts.assets += im.length; } catch (e) { mark('Automation', false, B + ' imports: ' + e.message); }
-      try { const sc = capped('Automation', B + ' scripts', await api.restPages(mid, '/automation/v1/scripts', { size: 200 })); sc.forEach(x => M.scripts.push(tag({ id: x.ssjsActivityId || x.id, name: x.name, ck: x.key, text: x.script || '', modified: x.modifiedDate, created: x.createdDate }))); job.counts.assets += sc.length; } catch (e) { mark('Automation', false, B + ' scripts: ' + e.message); }
-    }
-    tick(); check();
-
-    if (mods.has('Journey')) {
-      job.cur = 'Journey · ' + B; setMod('Journey', 'RUNNING');
-      try {
-        const js = capped('Journey', B + ' journeys', await api.restPages(mid, '/interaction/v1/interactions?mostRecentVersionOnly=false', { size: 100, sizeParam: '$pageSize' }));
-        const evs = capped('Journey', B + ' event definitions', await api.restPages(mid, '/interaction/v1/eventDefinitions', { size: 100, sizeParam: '$pageSize' }).catch(() => []));
-        evs.forEach(e => M.evs.push(tag({ key: e.eventDefinitionKey, deId: e.dataExtensionId, deName: e.dataExtensionName, type: e.type })));
-        const byKey = {}; js.forEach(j => { const k = j.key || j.id; (byKey[k] = byKey[k] || []).push(j); });
-        const latest = Object.values(byKey).map(v => v.sort((a, b) => (b.version || 0) - (a.version || 0))[0]);
-        const det = await pMap(latest.slice(0, MAX_DETAIL), CONCURRENCY, j => api.rest(mid, 'GET', '/interaction/v1/interactions/' + j.id).catch(() => j));
-        det.forEach(j => {
-          const vers = byKey[j.key || j.id] || [j];
-          const trig = arr(j.triggers)[0] || {};
-          const evKey = dig(trig, 'metaData', 'eventDefinitionKey') || dig(trig, 'configurationArguments', 'eventDefinitionKey');
-          const emails = arr(j.activities).filter(a => /EMAIL/i.test(a.type || '')).map(a => ({ name: a.name, emailId: dig(a, 'configurationArguments', 'triggeredSend', 'emailId'), subject: dig(a, 'configurationArguments', 'triggeredSend', 'emailSubject') }));
-          M.journeys.push(tag({ id: j.id, key: j.key || j.id, name: j.name, version: j.version, status: j.status, entryMode: j.entryMode, evKey, emails, acts: arr(j.activities).length, goal: !!(j.goals && j.goals.length), created: j.createdDate, modified: j.modifiedDate, versions: vers.map(v => ({ v: v.version, status: v.status, modified: v.modifiedDate })) }));
-        });
-        if (latest.length > MAX_DETAIL) mark('Journey', false, B + ': detail limited to ' + MAX_DETAIL + ' journeys');
-        L(B + ': Journey API returned ' + plural(latest.length, 'journey') + ' · ' + js.length + ' versions'); job.counts.assets += latest.length; mark('Journey', true);
-      } catch (e) { mark('Journey', false, B + ': ' + e.message); L(B + ': Journeys failed — ' + e.message); }
-    }
-    tick(); check();
-
-    if (mods.has('Content') || mods.has('CloudPages')) {
-      const types = [...(mods.has('Content') ? CONTENT_TYPES : []), ...(mods.has('CloudPages') ? PAGE_TYPES : [])];
-      job.cur = 'Content · ' + B; if (mods.has('Content')) setMod('Content', 'RUNNING'); if (mods.has('CloudPages')) setMod('CloudPages', 'RUNNING');
-      try {
-        let page = 1, got = 0, total = null, cut = false;
-        for (; ; page++) {
-          if (page > MAX_PAGES) { cut = true; break; }
-          const j = await api.rest(mid, 'POST', '/asset/v1/content/assets/query', { page: { page, pageSize: 200 }, query: { property: 'assetType.name', simpleOperator: 'in', value: types }, fields: ['id', 'customerKey', 'name', 'assetType', 'category', 'modifiedDate', 'createdDate', 'content', 'views', 'legacyData', 'status'] });
-          const items = j.items || []; total = j.count; got += items.length;
-          items.forEach(a => {
-            const tn = dig(a, 'assetType', 'name') || '';
-            let text = (a.content || '') + '\n' + (a.views ? JSON.stringify(a.views) : ''); if (text.length > 300000) text = text.slice(0, 300000);
-            M.content.push(tag({ id: String(a.id), ck: a.customerKey, name: a.name, typeName: tn, isPage: PAGE_TYPES.includes(tn), folder: dig(a, 'category', 'name'), modified: a.modifiedDate, created: a.createdDate, legacyId: dig(a, 'legacyData', 'legacyId'), status: dig(a, 'status', 'name'), text }));
-          });
-          if (!items.length || (total != null ? got >= total : items.length < 200)) break;
-        }
-        if (cut || (total != null && got < total)) { ['Content', 'CloudPages'].forEach(m => mods.has(m) && mark(m, false, B + ': ' + got + ' of ' + (total != null ? total : '?') + ' assets paged (page limit)')); }
-        L(B + ': Content Builder ' + got.toLocaleString('en-US') + ' assets paged'); job.counts.assets += got;
-        if (mods.has('Content')) mark('Content', true); if (mods.has('CloudPages')) mark('CloudPages', true);
-      } catch (e) { ['Content', 'CloudPages'].forEach(m => mods.has(m) && mark(m, false, B + ': ' + e.message)); L(B + ': Content failed — ' + e.message); }
-    }
-    tick(); tick();
-  }
-  ['Security', 'Data', 'SQL', 'Automation', 'Journey', 'Content', 'CloudPages'].forEach(m => { if (!mods.has(m)) return; const c = cov[m]; setMod(m, !c.ok ? 'FAILED' : c.fail ? 'PARTIAL' : 'SUCCESS'); });
-
-  job.cur = 'Analysis'; setMod('Governance', mods.has('Governance') ? 'RUNNING' : 'SKIPPED');
-  const ds = analyze(M, { bus, allBus, entMid, mods, cov, naming: opts.naming, rulesX: opts.rulesX || {}, L, job });
-  if (mods.has('Governance')) { mark('Governance', true); setMod('Governance', 'SUCCESS'); }
-  return { ds, api };
+function newScanState({ id, connId, n, scanId, by, opts = {} }) {
+  const modules = opts.modules && opts.modules.length ? opts.modules.filter(m => MODULES.includes(m)) : MODULES;
+  const st = {
+    id, connId, n, scanId, by: by || '',
+    opts: { modules, mids: opts.mids && opts.mids.length ? opts.mids.map(String) : null, mode: opts.mode || 'Full Assessment', naming: opts.naming || null, rulesX: opts.rulesX || {},
+      limits: opts.limits || { maxPages: MAX_PAGES, maxDetail: MAX_DETAIL, concurrency: CONCURRENCY }, keepScans: +opts.keepScans || 0 },
+    t0: Date.now(), pct: 0, cur: 'Starting', log: [], mods: {}, counts: { assets: 0, rels: 0, rules: 0, findings: 0, warnings: 0, errors: 0 }, cov: {},
+    done: false, error: null, cancelled: false, partial: false, calls: 0, plan: [{ k: 'org' }], at: 0, cursor: null, parts: 0, org: null, tok: null,
+  };
+  MODULES.forEach(m => { st.cov[m] = { ok: 0, fail: 0, notes: [] }; st.mods[m] = modules.includes(m) ? 'QUEUED' : 'SKIPPED'; });
+  return st;
 }
+
+// Helpers for one step. The SFMC token cache travels between steps encrypted in st.tok (never returned to clients).
+function stepCtx(st, conn, api) {
+  if (!api) { api = new SFMC({ sub: conn.sub, cid: conn.cid, sec: dec(conn.secEnc) }); if (st.tok) try { api.tokens = JSON.parse(dec(st.tok)); } catch { } }
+  const L = (m) => { st.log.unshift({ t: elapsed(st.t0), m }); if (st.log.length > 300) st.log.pop(); };
+  const mark = (m, ok, note) => { const c = st.cov[m]; ok ? c.ok++ : c.fail++; if (note && c.notes.length < 4 && !c.notes.includes(note)) c.notes.push(note); if (!ok) st.counts.warnings++; };
+  const capped = (m, label, list) => { if (list && list.truncated) { mark(m, false, label + ': page limit reached (' + MAX_PAGES + ' pages)'); L(label + ': stopped at the page limit, results incomplete'); } return list; };
+  return { api, conn, mods: new Set(st.opts.modules), L, mark, capped, setMod: (m, s) => { st.mods[m] = s; }, part: emptyM() };
+}
+const buOf = (st, mid) => st.org.bus.find(b => b.mid === mid);
+
+const STEPS = {
+  async org(st, x) {
+    const { api, L, mark, capped, setMod, mods, conn } = x;
+    st.cur = 'Organization'; setMod('Organization', 'RUNNING');
+    const t = await api.token(conn.mid || null); L('Token issued · ' + scopeList(t.scope).length + ' scopes');
+    const disc = await discoverBus(api, conn.mid || null);
+    const entMid = disc.entId || (disc.bus[0] && disc.bus[0].mid);
+    mark('Organization', !disc.err, disc.err && ('BU discovery: ' + disc.err.message)); capped('Organization', 'BU discovery', disc.truncated && { truncated: true });
+    const allBus = disc.bus, wanted = new Set(st.opts.mids || allBus.map(b => b.mid));
+    const bus = allBus.filter(b => wanted.has(b.mid));
+    L('Discovered ' + plural(allBus.length, 'Business Unit') + (entMid ? ' under Enterprise ' + entMid : '') + ' · scanning ' + bus.length);
+    setMod('Organization', disc.err || disc.truncated ? 'PARTIAL' : 'SUCCESS');
+    st.org = { bus, allBus, entMid };
+    const plan = [];
+    if (mods.has('Security')) plan.push({ k: 'security' });
+    for (const b of bus) {
+      plan.push({ k: 'bu', mid: b.mid });
+      for (const [m, k] of BU_STEPS) if (mods.has(m)) plan.push({ k, mid: b.mid });
+      if (mods.has('Content') || mods.has('CloudPages')) plan.push({ k: 'content', mid: b.mid });
+    }
+    st.plan = [st.plan[0], ...plan, { k: 'analyze' }];
+  },
+
+  async security(st, x) {
+    const { api, L, mark, capped, setMod, conn, part } = x;
+    st.cur = 'Security'; setMod('Security', 'RUNNING');
+    try { part.users = capped('Security', 'Users', await api.retrieveSafe(conn.mid || null, 'AccountUser', ['ID', 'UserID', 'Name', 'Email', 'ActiveFlag', 'IsAPIUser', 'LastSuccessfulLogin', 'CreatedDate', 'Client.ID'], ['ID', 'UserID', 'Name', 'ActiveFlag', 'LastSuccessfulLogin'], { all: true })); mark('Security', true); L('Collected ' + plural(part.users.length, 'user') + ' (SOAP AccountUser)'); }
+    catch (e) { mark('Security', false, 'Users: ' + e.message); L('Users unavailable — ' + e.message); }
+  },
+
+  // Token check for a BU; without access, its module steps are dropped from the plan.
+  async bu(st, x, step) {
+    const b = buOf(st, step.mid);
+    try { await x.api.token(b.mid); }
+    catch (e) {
+      x.L(b.name + ': no access for this package — ' + e.message);
+      BU_MODS.forEach(m => x.mods.has(m) && x.mark(m, false, b.name + ': ' + e.message));
+      st.plan = st.plan.filter((s, i) => i <= st.at || s.mid !== b.mid);
+    }
+  },
+
+  async data(st, x, step) {
+    const { api, L, mark, capped, setMod, part: M } = x, b = buOf(st, step.mid), mid = b.mid, B = b.name, tag = (o) => Object.assign(o, { mid, bu: B });
+    st.cur = 'Data · ' + B; setMod('Data', 'RUNNING');
+    try {
+      const des = capped('Data', B + ' DEs', await api.retrieveSafe(mid, 'DataExtension', ['ObjectID', 'CustomerKey', 'Name', 'IsSendable', 'CategoryID', 'CreatedDate', 'ModifiedDate', 'DataRetentionPeriodLength', 'DataRetentionPeriod', 'RowBasedRetention', 'RetainUntil', 'DeleteAtEndOfRetentionPeriod', 'Description', 'SendableDataExtensionField.Name', 'SendableSubscriberField.Name'], ['ObjectID', 'CustomerKey', 'Name', 'IsSendable', 'CategoryID', 'CreatedDate', 'ModifiedDate']));
+      des.forEach(d => M.des.push(tag({ objectId: d.ObjectID, ck: d.CustomerKey, name: d.Name, sendable: bool(d.IsSendable), categoryId: d.CategoryID, created: d.CreatedDate, modified: d.ModifiedDate, retLen: d.DataRetentionPeriodLength, retPeriod: d.DataRetentionPeriod, rowRet: bool(d.RowBasedRetention), retainUntil: d.RetainUntil, deleteAtEnd: bool(d.DeleteAtEndOfRetentionPeriod), retKnown: d.DataRetentionPeriodLength !== undefined || d.RowBasedRetention !== undefined, desc: d.Description, sendField: dig(d, 'SendableDataExtensionField', 'Name'), subField: dig(d, 'SendableSubscriberField', 'Name') })));
+      L(B + ': ' + plural(des.length, 'Data Extension') + ' (SOAP)'); st.counts.assets += des.length; mark('Data', true); if (!des.truncated) M.deDone.push(mid);
+      try {
+        const fs_ = capped('Data', B + ' DE fields', await api.retrieveSafe(mid, 'DataExtensionField', ['Name', 'IsPrimaryKey', 'FieldType', 'IsRequired', 'DataExtension.CustomerKey'], ['Name', 'IsPrimaryKey', 'DataExtension.CustomerKey']));
+        // A cut-off field list can end mid-DE; leave fields uncollected rather than report a false "no primary key".
+        if (!fs_.truncated) fs_.forEach(f => { const k = mid + '|' + dig(f, 'DataExtension', 'CustomerKey'); (M.fields[k] = M.fields[k] || []).push({ name: f.Name, pk: bool(f.IsPrimaryKey), type: f.FieldType }); });
+        L(B + ': ' + fs_.length.toLocaleString('en-US') + ' DE fields');
+      } catch (e) { mark('Data', false, B + ' fields: ' + e.message); }
+      try { const fo = await api.retrieve(mid, 'DataFolder', ['ID', 'Name', 'ParentFolder.ID', 'ContentType']); fo.forEach(f => { M.folders[mid + '|' + f.ID] = { name: f.Name, parent: dig(f, 'ParentFolder', 'ID') }; }); } catch { }
+    } catch (e) { mark('Data', false, B + ': ' + e.message); L(B + ': Data Extensions failed — ' + e.message); }
+  },
+
+  async sql(st, x, step) {
+    const { api, L, mark, capped, setMod, part: M } = x, b = buOf(st, step.mid), mid = b.mid, B = b.name, tag = (o) => Object.assign(o, { mid, bu: B });
+    st.cur = 'SQL · ' + B; setMod('SQL', 'RUNNING');
+    try {
+      const qs = capped('SQL', B + ' queries', await api.retrieveSafe(mid, 'QueryDefinition', ['ObjectID', 'CustomerKey', 'Name', 'QueryText', 'TargetType', 'DataExtensionTarget.Name', 'DataExtensionTarget.CustomerKey', 'TargetUpdateType', 'CreatedDate', 'ModifiedDate', 'CategoryID'], ['ObjectID', 'CustomerKey', 'Name', 'QueryText', 'DataExtensionTarget.Name', 'DataExtensionTarget.CustomerKey', 'TargetUpdateType', 'CreatedDate', 'ModifiedDate']));
+      qs.forEach(q => M.queries.push(tag({ objectId: q.ObjectID, ck: q.CustomerKey, name: q.Name, text: q.QueryText || '', targetName: dig(q, 'DataExtensionTarget', 'Name'), targetCk: dig(q, 'DataExtensionTarget', 'CustomerKey'), update: q.TargetUpdateType, created: q.CreatedDate, modified: q.ModifiedDate })));
+      L(B + ': ' + plural(qs.length, 'SQL Query') + ' (SOAP)'); st.counts.assets += qs.length; mark('SQL', true);
+    } catch (e) { mark('SQL', false, B + ': ' + e.message); L(B + ': SQL failed — ' + e.message); }
+  },
+
+  async automation(st, x, step) {
+    const { api, L, mark, capped, setMod, part: M } = x, b = buOf(st, step.mid), mid = b.mid, B = b.name, tag = (o) => Object.assign(o, { mid, bu: B });
+    st.cur = 'Automation · ' + B; setMod('Automation', 'RUNNING');
+    try {
+      const list = capped('Automation', B + ' automations', await api.restPages(mid, '/automation/v1/automations', { size: 200 }));
+      const det = await pMap(list.slice(0, MAX_DETAIL), CONCURRENCY, a => api.rest(mid, 'GET', '/automation/v1/automations/' + a.id).catch(() => a));
+      det.concat(list.slice(MAX_DETAIL)).forEach(a => {
+        const sid = a.statusId != null ? a.statusId : a.status;
+        const status = typeof a.status === 'string' && isNaN(+a.status) ? a.status : (AUTO_STATUS[sid] || 'Unknown');
+        const steps = arr(a.steps).flatMap(s => arr(s.activities).map(y => ({ name: y.name, typeId: y.objectTypeId, objectId: y.activityObjectId, step: s.step || s.stepNumber })));
+        M.autos.push(tag({ id: a.id, key: a.key || a.customerKey, name: a.name, status, lastRun: a.lastRunTime, lastRunStatus: a.lastRunStatus, schedule: a.schedule, steps, created: a.createdDate, modified: a.modifiedDate || a.lastSavedDate, detailed: !!a.steps }));
+      });
+      if (list.length > MAX_DETAIL) mark('Automation', false, B + ': detail limited to ' + MAX_DETAIL + ' automations');
+      L(B + ': ' + plural(list.length, 'Automation') + ' · ' + M.autos.reduce((n, a) => n + a.steps.length, 0) + ' activities (REST)'); st.counts.assets += list.length; mark('Automation', true);
+    } catch (e) { mark('Automation', false, B + ': ' + e.message); L(B + ': Automations failed — ' + e.message); }
+    try { const im = capped('Automation', B + ' imports', await api.restPages(mid, '/automation/v1/imports', { size: 200 })); im.forEach(i => M.imports.push(tag({ id: i.importDefinitionId || i.id, name: i.name, ck: i.customerKey, destId: i.destinationObjectId, destName: i.destinationName, modified: i.modifiedDate }))); st.counts.assets += im.length; } catch (e) { mark('Automation', false, B + ' imports: ' + e.message); }
+    try { const sc = capped('Automation', B + ' scripts', await api.restPages(mid, '/automation/v1/scripts', { size: 200 })); sc.forEach(s => M.scripts.push(tag({ id: s.ssjsActivityId || s.id, name: s.name, ck: s.key, text: s.script || '', modified: s.modifiedDate, created: s.createdDate }))); st.counts.assets += sc.length; } catch (e) { mark('Automation', false, B + ' scripts: ' + e.message); }
+  },
+
+  async journey(st, x, step) {
+    const { api, L, mark, capped, setMod, part: M } = x, b = buOf(st, step.mid), mid = b.mid, B = b.name, tag = (o) => Object.assign(o, { mid, bu: B });
+    st.cur = 'Journey · ' + B; setMod('Journey', 'RUNNING');
+    try {
+      const js = capped('Journey', B + ' journeys', await api.restPages(mid, '/interaction/v1/interactions?mostRecentVersionOnly=false', { size: 100, sizeParam: '$pageSize' }));
+      const evs = capped('Journey', B + ' event definitions', await api.restPages(mid, '/interaction/v1/eventDefinitions', { size: 100, sizeParam: '$pageSize' }).catch(() => []));
+      evs.forEach(e => M.evs.push(tag({ key: e.eventDefinitionKey, deId: e.dataExtensionId, deName: e.dataExtensionName, type: e.type })));
+      const byKey = {}; js.forEach(j => { const k = j.key || j.id; (byKey[k] = byKey[k] || []).push(j); });
+      const latest = Object.values(byKey).map(v => v.sort((a, c) => (c.version || 0) - (a.version || 0))[0]);
+      const det = await pMap(latest.slice(0, MAX_DETAIL), CONCURRENCY, j => api.rest(mid, 'GET', '/interaction/v1/interactions/' + j.id).catch(() => j));
+      det.forEach(j => {
+        const vers = byKey[j.key || j.id] || [j];
+        const trig = arr(j.triggers)[0] || {};
+        const evKey = dig(trig, 'metaData', 'eventDefinitionKey') || dig(trig, 'configurationArguments', 'eventDefinitionKey');
+        const emails = arr(j.activities).filter(a => /EMAIL/i.test(a.type || '')).map(a => ({ name: a.name, emailId: dig(a, 'configurationArguments', 'triggeredSend', 'emailId'), subject: dig(a, 'configurationArguments', 'triggeredSend', 'emailSubject') }));
+        M.journeys.push(tag({ id: j.id, key: j.key || j.id, name: j.name, version: j.version, status: j.status, entryMode: j.entryMode, evKey, emails, acts: arr(j.activities).length, goal: !!(j.goals && j.goals.length), created: j.createdDate, modified: j.modifiedDate, versions: vers.map(v => ({ v: v.version, status: v.status, modified: v.modifiedDate })) }));
+      });
+      if (latest.length > MAX_DETAIL) mark('Journey', false, B + ': detail limited to ' + MAX_DETAIL + ' journeys');
+      L(B + ': Journey API returned ' + plural(latest.length, 'journey') + ' · ' + js.length + ' versions'); st.counts.assets += latest.length; mark('Journey', true);
+    } catch (e) { mark('Journey', false, B + ': ' + e.message); L(B + ': Journeys failed — ' + e.message); }
+  },
+
+  // Content Builder query, CONTENT_PAGES_PER_STEP pages per step; returns { more: cursor } until done.
+  async content(st, x, step, cursor) {
+    const { api, L, mark, setMod, mods, part: M } = x, b = buOf(st, step.mid), mid = b.mid, B = b.name, tag = (o) => Object.assign(o, { mid, bu: B });
+    const types = [...(mods.has('Content') ? CONTENT_TYPES : []), ...(mods.has('CloudPages') ? PAGE_TYPES : [])];
+    st.cur = 'Content · ' + B; if (mods.has('Content')) setMod('Content', 'RUNNING'); if (mods.has('CloudPages')) setMod('CloudPages', 'RUNNING');
+    const c = cursor || { page: 1, got: 0, total: null };
+    try {
+      let end = false, cut = false;
+      for (let i = 0; i < CONTENT_PAGES_PER_STEP; i++, c.page++) {
+        if (c.page > MAX_PAGES) { cut = true; break; }
+        const j = await api.rest(mid, 'POST', '/asset/v1/content/assets/query', { page: { page: c.page, pageSize: 200 }, query: { property: 'assetType.name', simpleOperator: 'in', value: types }, fields: ['id', 'customerKey', 'name', 'assetType', 'category', 'modifiedDate', 'createdDate', 'content', 'views', 'legacyData', 'status'] });
+        const items = j.items || []; c.total = j.count != null ? j.count : c.total; c.got += items.length; st.counts.assets += items.length;
+        items.forEach(a => {
+          const tn = dig(a, 'assetType', 'name') || '';
+          let text = (a.content || '') + '\n' + (a.views ? JSON.stringify(a.views) : ''); if (text.length > 300000) text = text.slice(0, 300000);
+          M.content.push(tag({ id: String(a.id), ck: a.customerKey, name: a.name, typeName: tn, isPage: PAGE_TYPES.includes(tn), folder: dig(a, 'category', 'name'), modified: a.modifiedDate, created: a.createdDate, legacyId: dig(a, 'legacyData', 'legacyId'), status: dig(a, 'status', 'name'), text }));
+        });
+        if (!items.length || (c.total != null ? c.got >= c.total : items.length < 200)) { end = true; break; }
+      }
+      if (!end && !cut) return { more: c };
+      if (cut || (c.total != null && c.got < c.total)) { ['Content', 'CloudPages'].forEach(m => mods.has(m) && mark(m, false, B + ': ' + c.got + ' of ' + (c.total != null ? c.total : '?') + ' assets paged (page limit)')); }
+      L(B + ': Content Builder ' + c.got.toLocaleString('en-US') + ' assets paged');
+      if (mods.has('Content')) mark('Content', true); if (mods.has('CloudPages')) mark('CloudPages', true);
+    } catch (e) { ['Content', 'CloudPages'].forEach(m => mods.has(m) && mark(m, false, B + ': ' + e.message)); L(B + ': Content failed — ' + e.message); }
+  },
+};
+
+function finishScan(st, x, M) {
+  const { mods, L, mark, setMod } = x;
+  ['Security', 'Data', 'SQL', 'Automation', 'Journey', 'Content', 'CloudPages'].forEach(m => { if (!mods.has(m)) return; const c = st.cov[m]; setMod(m, !c.ok ? 'FAILED' : c.fail ? 'PARTIAL' : 'SUCCESS'); });
+  st.cur = 'Analysis'; setMod('Governance', mods.has('Governance') ? 'RUNNING' : 'SKIPPED');
+  const { bus, allBus, entMid } = st.org;
+  const ds = analyze(M, { bus, allBus, entMid, mods, cov: st.cov, naming: st.opts.naming, rulesX: st.opts.rulesX || {}, L, job: st });
+  if (mods.has('Governance')) { mark('Governance', true); setMod('Governance', 'SUCCESS'); }
+  return ds;
+}
+
+// Whole scan in memory with one SFMC client. Throws on a fatal error, like a failed job.
+async function runScan(job, conn, opts) {
+  const cancelled = !!job.cancelled;
+  const st = Object.assign(job, newScanState({ id: job.id || 'mem', connId: conn.id, n: job.n || 1, scanId: job.scanId || '#001', by: job.by, opts }));
+  st.cancelled = cancelled;
+  const M = emptyM(); let api = null;
+  for (;;) {
+    if (st.cancelled) throw new ApiErr('Cancelled by user', 0, 'cancel');
+    const x = stepCtx(st, conn, api); api = x.api;
+    const step = st.plan[st.at];
+    if (step.k === 'analyze') { st.calls = api.calls; return { ds: finishScan(st, x, M), api: { calls: api.calls } }; }
+    const r = await STEPS[step.k](st, x, step, st.cursor);
+    mergeM(M, x.part);
+    if (r && r.more) st.cursor = r.more; else { st.at++; st.cursor = null; }
+  }
+}
+
+async function saveScanResult(st, ds, L) {
+  const sum = { n: st.n, id: st.scanId, date: fmtD(new Date()), iso: new Date().toISOString(), ...ds.summary, mode: String(st.opts.mode || 'Full').split(' ')[0], by: st.by, dur: elapsed(st.t0), calls: st.calls };
+  delete ds.summary;
+  if (!(await store.addScan(st.connId, sum, { ...ds, scan: sum }))) throw new ApiErr('The connection was deleted during the scan — snapshot discarded', 0, 'gone');
+  await store.pruneScans(st.connId, st.opts.keepScans);
+  await store.updateConnection(st.connId, { status: 'Connected' });
+  st.pct = 100; st.cur = 'Complete'; st.partial = ds.limits.length > 2; st.done = true;
+  L('Scores calculated · snapshot ' + st.scanId + ' stored · ' + st.calls + ' API calls');
+}
+
+// Advances a stored job by one step. Returns the new state, or null when the job isn't runnable now
+// (finished, unknown, or another worker holds the lease).
+async function runStep(jobId) {
+  const job = await store.claimJob(jobId, Date.now(), STEP_LEASE); if (!job) return null;
+  const st = job.state;
+  const log = (m) => { st.log.unshift({ t: elapsed(st.t0), m }); if (st.log.length > 300) st.log.pop(); };
+  try {
+    if (job.cancel) throw new ApiErr('Cancelled by user', 0, 'cancel');
+    const conn = await store.getConnection(st.connId); if (!conn) throw new ApiErr('The connection was deleted during the scan — snapshot discarded', 0, 'gone');
+    applyLimits(st.opts.limits);
+    const x = stepCtx(st, conn), step = st.plan[st.at];
+    if (step.k === 'analyze') {
+      const M = emptyM(); for (let i = 0; i < st.parts; i++) { const p = await store.getJobPart(jobId, i); if (p) mergeM(M, unpackPart(p)); }
+      await saveScanResult(st, finishScan(st, x, M), log);
+    } else {
+      const r = await STEPS[step.k](st, x, step, st.cursor);
+      st.calls += x.api.calls; st.tok = enc(JSON.stringify(x.api.tokens));
+      // Part first, then state: if we die in between, the retry rewrites the same part number.
+      if (hasData(x.part)) { await store.putJobPart(jobId, st.parts, packPart(x.part)); st.parts++; }
+      if (r && r.more) st.cursor = r.more; else { st.at++; st.cursor = null; }
+      st.pct = Math.min(97, Math.round(100 * st.at / st.plan.length));
+    }
+  } catch (e) {
+    st.error = e.message; st.done = true; st.counts.errors++; log('Scan stopped — ' + e.message);
+    if (e.code === 'cancel') st.cancelled = true;
+    if (e.status === 401 || e.code === 'auth') await store.updateConnection(st.connId, { status: 'Needs re-auth' }).catch(() => { });
+  }
+  if (st.done) st.tok = null;
+  await store.saveJob(jobId, st, !st.done ? 'running' : st.error ? 'failed' : 'done', Date.now());
+  if (st.done) await store.deleteJobParts(jobId);
+  return st;
+}
+
+// Background driver (local / long-running server): steps a job to the end. One loop per job per process.
+const driving = new Set();
+function kick(jobId) {
+  if (driving.has(jobId)) return; driving.add(jobId);
+  (async () => { try { for (;;) { const st = await runStep(jobId); if (!st || st.done) break; } } catch (e) { console.error('Scan ' + jobId + ':', e); } finally { driving.delete(jobId); } })();
+}
+const pubJob = (j) => { const s = j.state; return { connId: s.connId, scanId: s.scanId, n: s.n, pct: s.pct, cur: s.cur, mods: s.mods, counts: s.counts, done: s.done, error: s.error, cancelled: !!(j.cancel || s.cancelled), partial: s.partial, log: s.log.slice(0, 60), elapsed: elapsed(s.t0) }; };
 
 function analyze(M, o) {
   const { bus, entMid, mods, cov, L, job } = o;
@@ -782,32 +898,26 @@ async function api(req, res, url) {
   }
   if (p === '/api/scans' && m === 'POST') {
     const b = await readBody(req); const c = await store.getConnection(b.connId); if (!c) return send(req, res, 404, { error: 'Connection not found' });
-    // Check and register with no await in between, so two concurrent requests can't both start a scan.
-    if (Object.values(jobs).some(j => j.connId === c.id && !j.done)) return send(req, res, 409, { error: 'A scan is already running for this connection.' });
-    const jobId = 'j' + crypto.randomBytes(5).toString('hex');
-    const job = jobs[jobId] = { connId: c.id, scanId: null, n: 0, t0: Date.now(), pct: 0, cur: 'Starting', log: [], mods: {}, counts: { assets: 0, rels: 0, rules: 0, findings: 0, warnings: 0, errors: 0 }, done: false, error: null, cancelled: false };
-    let list, st; try { list = await store.listScans(c.id); st = await settings(); } catch (e) { delete jobs[jobId]; throw e; }
-    const n = (list.length ? list[list.length - 1].n : 0) + 1, id = '#' + String(n).padStart(3, '0');
-    job.n = n; job.scanId = id; applyLimits(st.scan);
-    (async () => {
-      try {
-        const { ds, api: cl } = await runScan(job, c, { ...b, rulesX: st.rulesX });
-        const sum = { n, id, date: fmtD(new Date()), iso: new Date().toISOString(), ...ds.summary, mode: String(b.mode || 'Full').split(' ')[0], by: me.name, dur: elapsed(job.t0), calls: cl.calls };
-        delete ds.summary;
-        if (!(await store.addScan(c.id, sum, { ...ds, scan: sum }))) throw new ApiErr('The connection was deleted during the scan — snapshot discarded', 0, 'gone');
-        await store.pruneScans(c.id, +st.data.keepScans || 0);
-        await store.updateConnection(c.id, { status: 'Connected' });
-        job.pct = 100; job.cur = 'Complete'; job.log.unshift({ t: elapsed(job.t0), m: 'Scores calculated · snapshot ' + id + ' stored · ' + cl.calls + ' API calls' }); job.partial = ds.limits.length > 2;
-      } catch (e) {
-        job.error = e.message; job.counts.errors++; job.log.unshift({ t: elapsed(job.t0), m: 'Scan stopped — ' + e.message });
-        if (e.status === 401 || e.code === 'auth') await store.updateConnection(c.id, { status: 'Needs re-auth' }).catch(() => { });
-      }
-      job.done = true; setTimeout(() => delete jobs[jobId], 3600e3).unref();
-    })();
+    const [list, st] = await Promise.all([store.listScans(c.id), settings()]);
+    const n = (list.length ? list[list.length - 1].n : 0) + 1, id = '#' + String(n).padStart(3, '0'), jobId = 'j' + crypto.randomBytes(5).toString('hex');
+    const state = newScanState({ id: jobId, connId: c.id, n, scanId: id, by: me.name, opts: { modules: b.modules, mids: b.mids, mode: b.mode, naming: b.naming, rulesX: st.rulesX, keepScans: st.data.keepScans,
+      limits: { maxPages: st.scan.maxPages, maxDetail: st.scan.maxDetail, concurrency: st.scan.concurrency } } });
+    // One running job per connection, enforced by the store; the running job's id lets the UI re-attach to it.
+    const r = await store.createJob({ id: jobId, connId: c.id, state, now: Date.now() });
+    if (!r.ok) return send(req, res, 409, { error: 'A scan is already running for this connection.', jobId: r.running });
+    if (!SCAN_POLL) kick(jobId);
     return send(req, res, 200, { jobId, scanId: id });
   }
   mm = p.match(/^\/api\/jobs\/(\w+)(\/cancel)?$/);
-  if (mm) { const j = jobs[mm[1]]; if (!j) return send(req, res, 404, { error: 'Job not found' }); if (mm[2]) j.cancelled = true; const { t0, ...pub } = j; return send(req, res, 200, { ...pub, log: j.log.slice(0, 60), elapsed: elapsed(t0) }); }
+  if (mm) {
+    const id = mm[1]; let j = await store.getJob(id); if (!j) return send(req, res, 404, { error: 'Job not found' });
+    if (mm[2] && m === 'POST') await store.requestCancel(id);
+    // Poll mode: this request runs the next step (if no one else is). Background mode: make sure a driver is
+    // running — after a restart, the first poll resumes the job once the old lease has expired.
+    if (j.status === 'running') { if (SCAN_POLL) await runStep(id); else kick(id); }
+    j = await store.getJob(id);
+    return send(req, res, 200, pubJob(j));
+  }
   return send(req, res, 404, { error: 'Unknown endpoint' });
 }
 
@@ -841,5 +951,5 @@ async function handle(req, res) {
 if (require.main === module) http.createServer(handle).listen(PORT, HOST, () => console.log(`MCNexus ${VERSION} → http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}/  (storage: ${PG ? 'PostgreSQL' : DATA})`));
 
 // Internals exported for tests (test/). Set MCNEXUS_DATA / MCNEXUS_KEY before requiring: the store loads on require.
-module.exports = { handle, useStore, withDefaults, SESSION_IDLE, SESSION_MAX, analyze, runScan, testConnection, SFMC, ApiErr, xmlObj, sqlSources, sqlDepth, patternRe, enc, dec, hid, score,
+module.exports = { handle, useStore, withDefaults, SESSION_IDLE, SESSION_MAX, setScanMode, runStep, STEP_LEASE, packPart, unpackPart, analyze, runScan, testConnection, SFMC, ApiErr, xmlObj, sqlSources, sqlDepth, patternRe, enc, dec, hid, score,
   RULES, RULE, RULESET, VERSION, DOMAINS, DOMAIN_OF, MODULES, SEVS, W, PEN, SECRET_RE, STATIC_OK };

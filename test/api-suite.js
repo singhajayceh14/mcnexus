@@ -134,6 +134,8 @@ test('scan runs as a job and the dataset matches the UI data contract', async ()
 test('only one scan per connection at a time', async () => {
   const rs = await Promise.all([call('POST', '/api/scans', { connId: state.cid }), call('POST', '/api/scans', { connId: state.cid })]);
   assert.deepEqual(rs.map(r => r.status).sort(), [200, 409]);
+  const ok = rs.find(r => r.status === 200), busy = rs.find(r => r.status === 409);
+  assert.equal(busy.json.jobId, ok.json.jobId, '409 names the running job so the UI can re-attach');
   await waitJob(rs.find(r => r.status === 200).json.jobId);
 });
 
@@ -176,9 +178,75 @@ test('password change requires the current password and signs out other sessions
   OWNER.password = 'new-password-1';
 });
 
+// ---------- resumable scans ----------
+const TOKEN_RE = /tok-\d+-\d+/;   // the fake tenant's access tokens
+const lastTwo = async () => { const d = (await call('GET', '/api/connections/' + state.cid + '/dataset')).json; return d.scans.slice(-2); };
+const findingIds = async (sid) => (await call('GET', '/api/connections/' + state.cid + '/dataset?scan=' + encodeURIComponent(sid))).json.findings.map(f => f.id).sort();
+const inventory = async (sid) => (await call('GET', '/api/connections/' + state.cid + '/dataset?scan=' + encodeURIComponent(sid))).json.inventory;
+
+test('poll mode: one step per poll, overlapping polls never repeat a step, result matches a background scan', async () => {
+  srv.setScanMode('poll');
+  try {
+    const calls0 = fake.calls.length;
+    const id = (await call('POST', '/api/scans', { connId: state.cid, mode: 'Full Assessment' })).json.jobId;
+    assert.equal((await ctx.store.getJob(id)).state.at, 0, 'nothing runs until polled');
+    await call('GET', '/api/jobs/' + id);
+    assert.equal((await ctx.store.getJob(id)).state.at, 1, 'one step per poll');
+    let done = null;
+    for (let i = 0; i < 100 && !done; i++) done = (await Promise.all([1, 2, 3].map(() => call('GET', '/api/jobs/' + id)))).map(r => r.json).find(j => j.done) || null;
+    assert.ok(done, 'finished');
+    assert.equal(done.error, null);
+    assert.equal(done.pct, 100);
+    for (const k of ['plan', 'tok', 'opts', 'cov', 'org', 'cursor']) assert.ok(!(k in done), 'job response exposes ' + k);
+    const [a, b] = await lastTwo();
+    assert.deepEqual(await inventory(b.id), await inventory(a.id), 'no duplicated data');
+    // Steps are idempotent (a re-run rewrites the same part), so duplicates show up only as repeated SFMC calls.
+    const deRetrieves = fake.calls.slice(calls0).filter(c => /<ObjectType>DataExtension</.test(c.body) && !/__mcnexus_probe__/.test(c.body));
+    assert.equal(deRetrieves.length, 2, 'one DataExtension retrieve per BU — the lease stopped concurrent polls repeating a step');
+    assert.deepEqual(await findingIds(b.id), await findingIds(a.id));
+    assert.equal(await ctx.store.getJobPart(id, 0), null, 'parts deleted when the job ends');
+  } finally { srv.setScanMode('background'); }
+});
+
+test('cancel ends a job at the next step and frees the connection', async () => {
+  srv.setScanMode('poll');
+  try {
+    const before = (await lastTwo()).length;
+    const id = (await call('POST', '/api/scans', { connId: state.cid })).json.jobId;
+    await call('GET', '/api/jobs/' + id);
+    const j = (await call('POST', '/api/jobs/' + id + '/cancel')).json;
+    assert.deepEqual([j.done, j.cancelled, j.error], [true, true, 'Cancelled by user']);
+    const again = await call('POST', '/api/scans', { connId: state.cid });
+    assert.equal(again.status, 200, 'connection free again');
+    assert.equal((await call('POST', '/api/jobs/' + again.json.jobId + '/cancel')).json.done, true);
+    assert.equal((await lastTwo()).length, before, 'no scan stored');
+  } finally { srv.setScanMode('background'); }
+});
+
+test('an interrupted scan resumes after a restart; tokens stay encrypted throughout', async () => {
+  srv.setScanMode('poll');
+  const id = (await call('POST', '/api/scans', { connId: state.cid })).json.jobId;
+  await call('GET', '/api/jobs/' + id); await call('GET', '/api/jobs/' + id);   // org + security done
+  const mid = await ctx.store.getJob(id);
+  assert.ok(mid.state.at >= 2 && mid.state.tok, 'token cache carried between steps');
+  assert.doesNotMatch(await ctx.raw(), TOKEN_RE, 'access token stored in plaintext');
+  await ctx.store.claimJob(id, Date.now(), 50);   // a worker died holding a short lease
+  ctx.store = ctx.reopen(); srv.useStore(ctx.store); srv.setScanMode('background');   // restart, local mode
+  const r = await call('POST', '/api/scans', { connId: state.cid });
+  assert.deepEqual([r.status, r.json.jobId], [409, id], 'start again → re-attach to the stalled job');
+  await new Promise(ok => setTimeout(ok, 60));   // let the dead worker's lease lapse
+  const j = await waitJob(id);
+  assert.equal(j.error, null);
+  const [a, b] = await lastTwo();
+  assert.deepEqual(await findingIds(b.id), await findingIds(a.id));
+  assert.equal((await ctx.store.getJob(id)).state.tok, null, 'token cache dropped at the end');
+  for (const body of bodies) assert.doesNotMatch(body, TOKEN_RE, 'access token in a response');
+});
+
 test('clearing scans keeps the connection; deleting removes scans and triage from disk', async () => {
   const p = '/api/connections/' + state.cid;
-  assert.equal((await call('DELETE', p + '/scans')).json.deleted, 2);
+  const had = (await call('GET', p + '/dataset')).json.scans.length;
+  assert.equal((await call('DELETE', p + '/scans')).json.deleted, had);
   assert.equal((await call('GET', p + '/dataset')).json.scans.length, 0);
   assert.equal(await ctx.store.getSnapshot(state.cid, 1), null);
   assert.equal((await call('DELETE', p)).status, 200);

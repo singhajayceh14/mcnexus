@@ -79,10 +79,12 @@ test('a BU the package cannot access is reported as partial coverage, not a cras
   assert.ok(job.log.some(l => /Locked BU: no access/.test(l.m)));
 });
 
-test('cancellation stops the scan', async () => {
+test('a cancelled scan stops before calling SFMC', async () => {
   install(sfmcOrg());
   const job = newJob(); job.cancelled = true;
   await assert.rejects(runScan(job, conn(), {}), /Cancelled by user/);
+  assert.equal(fake.calls.length, 0);
+  fake.restore(); fake = null;
 });
 
 test('a bad client secret fails the scan with an auth error', async () => {
