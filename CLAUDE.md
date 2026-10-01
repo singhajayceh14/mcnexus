@@ -9,6 +9,7 @@ MCNexus is a read-only assessment tool for Salesforce Marketing Cloud Engagement
 - `MCNexus App.dc.html` — **the product UI.** One Design Component: a template plus a `class Component extends DCLogic` logic block. Opens directly in a browser.
 - `support.js` — DC runtime. Never edit by hand.
 - `server/mcnexus-server.js` — **the backend.** Node 22+. Serves the UI, handles auth and sessions, calls SFMC, runs the rules. Scans are resumable jobs: `STEPS` (one per BU × module, content paged across steps) run by `runStep()`, which holds a lease. A step must be idempotent: it collects into its own part and never mutates earlier parts. New collection goes into a step plus the plan built in `STEPS.org`.
+- `server/analyze.js` — the rule catalog (`RULES`, `DOMAINS`, `RULESET`), SQL/AMPscript parsers and `analyze()`. No I/O; it also runs in `server/analyze-worker.js`, the worker thread that analyses a finished scan.
 - `server/store.js` — the storage contract (documented at the top) and `JsonStore` (default). `server/store-pg.js` — `PgStore` for PostgreSQL/Neon, chosen when `DATABASE_URL` is set. Routes only talk to `store`; never read or write files or SQL from a route.
 - `server/schema.sql` — PostgreSQL schema. Idempotent; each statement ends with `;` at end of line and contains no other `;` (the Neon HTTP driver runs them one by one). Change it by appending, and bump `schema_version` / `SCHEMA_VERSION`.
 - `server/migrate-json-to-pg.js` — installs the schema and copies a JSON data folder into PostgreSQL.
@@ -33,7 +34,7 @@ MCNexus is a read-only assessment tool for Salesforce Marketing Cloud Engagement
    - Always set `hint-*` on `sc-if` / `sc-for`.
 5. **Demo fallback must keep working.** If `/api/health` isn't reachable, the UI runs on the embedded `DEMO` dataset with a banner. Every new UI value needs both a `live` path and a demo path.
 6. **Finding IDs are stable:** `F-` + sha1(rule|objKey)[0:6]. Don't change the scheme; triage and scan-compare depend on it.
-7. **Domain order is fixed** (`DOMAINS` in the server). Scan `dom[]` arrays are aligned to it. Append new domains only at the end.
+7. **Domain order is fixed** (`DOMAINS` in `server/analyze.js`). Scan `dom[]` arrays are aligned to it. Append new domains only at the end.
 
 ## Data contract (server → UI)
 `GET /api/connections/:id/dataset` returns:
@@ -49,6 +50,7 @@ MCNexus is a read-only assessment tool for Salesforce Marketing Cloud Engagement
 Asset keys are `TYPE:MID:id`: DE, SQL, AUTO, IMP, SCR, JRN, CNT. Virtual node keys: DV, EML, USR, NAM.
 
 ## Adding a rule
+All in `server/analyze.js`:
 1. Add a row to `RULES`: `[id, name, CATEGORY, objectType, defaultSev, version]`. CATEGORY must map through `DOMAIN_OF`.
 2. Emit it inside `analyze()` with `finding(ruleId, asset, {why, evidence, rec, …})`, guarded by `mods.has(module)`.
 3. Increment `rulesRun` for each evaluation.

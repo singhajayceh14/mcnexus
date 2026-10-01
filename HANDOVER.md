@@ -44,6 +44,7 @@ Node server (server/mcnexus-server.js)
    ├─ Store (server/store.js): one async contract, two backends
    │    JSON (default): server/data/store.json + scans/<connId>/<n>.json
    │    PostgreSQL (DATABASE_URL, Neon): server/store-pg.js + server/schema.sql
+   ├─ Scans: stored jobs run as resumable steps; the final analysis runs in a worker thread (server/analyze-worker.js)
    ├─ Crypto: AES-256-GCM for client secrets (server/data/.key or MCNEXUS_KEY)
    └─ SFMC client: OAuth2 client_credentials per BU (account_id), REST + SOAP,
                    pagination, 429/5xx retry with backoff, property fallback
@@ -128,8 +129,9 @@ Severity overrides and enable/disable are set in **Admin → Rules** and apply f
 - **Limits for large orgs:** capped by `MCNEXUS_MAX_PAGES` and `MCNEXUS_MAX_DETAIL`. When a cap is hit, coverage is marked PARTIAL. The UI shows the first 400 findings or assets per filter.
 - **Deployment:**
   - Storage can be JSON files (laptop or single VM) or PostgreSQL (`DATABASE_URL`, Neon). See "Moving to PostgreSQL" in server/README.md. With JSON storage, run a single process.
+  - Locally a scan runs in the background on the server: the UI shows it as "Scan #N running · %" in the header on every screen, finds it again after a reload, and refreshes the dashboard when it ends. A server restart resumes running scans automatically.
   - In poll mode (Vercel) a scan advances only while the progress screen is open. If the tab is closed, the scan pauses; starting a scan for that org again re-attaches to it and carries on.
-  - The final analysis step holds the whole org in memory, as before, and each step must fit the function time limit. Very large Business Units may need a higher Vercel `maxDuration`.
+  - The final analysis holds the whole org in memory (in a worker thread, so the server keeps answering other requests), and each step must fit the function time limit. Very large Business Units may need a higher Vercel `maxDuration`.
   - For multi-user hosting, put TLS in front.
 - **Report formats:** PDF uses the browser print dialog. "Excel" exports CSV (UTF-8 with BOM).
 
