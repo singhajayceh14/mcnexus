@@ -29,7 +29,7 @@ const soapEnv = (inner) => new Response(`<?xml version="1.0" encoding="utf-8"?><
 
 /**
  * org: { sub, cid, sec, ent, mids: { [mid]: { soap: { Type: rows[] }, rest: { automations, imports, scripts, interactions, eventDefinitions, assets } } },
- *        rejectProps: { Type: [prop] }, soapPage, restPageCap, fail429 }
+ *        rejectProps: { Type: [prop] }, soapPage, restPageCap, fail429, latency (ms per call) }
  * BUs listed by BusinessUnit but missing from `mids` get an auth error (package has no access).
  */
 function fakeSfmc(org) {
@@ -94,6 +94,7 @@ function fakeSfmc(org) {
     const h = Object.fromEntries(Object.entries(init.headers || {}).map(([k, v]) => [k.toLowerCase(), String(v)]));
     const body = init.body == null ? '' : String(init.body);
     calls.push({ method, host: u.hostname, path: u.pathname, url: u.href, soapAction: h.soapaction, body });
+    if (org.latency) await new Promise(r => setTimeout(r, org.latency));   // otherwise a whole scan completes within one microtask burst
     if (u.hostname === `${org.sub}.auth.marketingcloudapis.com`) return u.pathname === '/v2/token' && method === 'POST' ? token(body) : json(404, {});
     const tok = (h.authorization || '').replace(/^Bearer\s+/, '') || (body.match(/<fueloauth[^>]*>([^<]+)</) || [])[1];
     const mid = tokens.get(tok); if (!mid) return json(401, { message: 'Not Authorized' });

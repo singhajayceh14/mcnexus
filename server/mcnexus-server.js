@@ -739,7 +739,7 @@ async function api(req, res, url) {
         list.push(sum); prune(c.id); c.status = 'Connected'; save();
         job.pct = 100; job.cur = 'Complete'; job.log.unshift({ t: elapsed(job.t0), m: 'Scores calculated · snapshot ' + id + ' stored · ' + cl.calls + ' API calls' }); job.partial = ds.limits.length > 2;
       } catch (e) { job.error = e.message; job.counts.errors++; job.log.unshift({ t: elapsed(job.t0), m: 'Scan stopped — ' + e.message }); if (e.status === 401 || e.code === 'auth') { c.status = 'Needs re-auth'; save(); } }
-      job.done = true; setTimeout(() => delete jobs[jobId], 3600e3);
+      job.done = true; setTimeout(() => delete jobs[jobId], 3600e3).unref();
     })();
     return send(req, res, 200, { jobId, scanId: id });
   }
