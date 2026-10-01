@@ -41,7 +41,8 @@ MCNexus is a read-only assessment tool for Salesforce Marketing Cloud Engagement
 - `scans[]` — summary per scan: `{id, date, health, cov, sev[5], rules, assets, dom[], clean, mode, by}`
 - `bus[]`
 - `domains[]`
-- `findings[]` — `{id, rule, sev, domain, bu, objType, obj, objKey, title, why, evidence[[k,v]], affected, rec, limit, chain?}`
+- `findings[]` — `{id, rule, sev, domain, bu, objType, obj, objKey, title, why, evidence[[k,v]], affected, rec, limit, chain?, code?}`
+  - `code` (code-based rules) — `[{where, line, col, lines[[n, text, isHit]]}]`: excerpts around each location, credential values masked. `where` is the code segment (`content`, `views.html`, `views.html.slots.<slot>.blocks.<block>`, `script`).
 - `assets[]` — `{key, name, type, bu, health, status, config[[k,v]], deps[], dependents[], history[], degree}`
 - `graph` — `{nodes:{key:[name,type,bu]}, edges:[[from,to,rel]]}` (the `nodes` map holds only virtual nodes: data views, emails, users)
 - `typeCounts`, `model`, `modules`, `inventory`, `limits`, `archNotes`, `quickWins`
