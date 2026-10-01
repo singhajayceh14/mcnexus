@@ -62,7 +62,9 @@ function fakeSfmc(org) {
     if (f) rows = rows.filter(r => String(get(r, f[1])) === f[2]);
     const size = org.soapPage || 2500, cont = (body.match(/<ContinueRequest>([^<]+)</) || [])[1];
     const off = cont ? +cont.split(':')[1] : 0, more = off + size < rows.length;
-    return soapEnv(`<OverallStatus>${more ? 'MoreDataAvailable' : 'OK'}</OverallStatus><RequestID>${type}:${off + size}</RequestID>` + rows.slice(off, off + size).map(r => `<Results xsi:type="${type}">${toXml(r)}</Results>`).join(''));
+    // Like SFMC, return only the requested properties (dotted paths keep their nesting).
+    const project = (r) => { const o = {}; props.forEach(p => { const v = get(r, p); if (v === undefined) return; const ks = p.split('.'); let t = o; ks.slice(0, -1).forEach(k => { t = t[k] = t[k] || {}; }); t[ks[ks.length - 1]] = v; }); return o; };
+    return soapEnv(`<OverallStatus>${more ? 'MoreDataAvailable' : 'OK'}</OverallStatus><RequestID>${type}:${off + size}</RequestID>` + rows.slice(off, off + size).map(r => `<Results xsi:type="${type}">${toXml(project(r))}</Results>`).join(''));
   }
 
   function rest(mid, method, u, body) {
