@@ -9,7 +9,9 @@
   "scripts": {
     "start": "node server/mcnexus-server.js",
     "check": "node --check server/mcnexus-server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "db:schema": "node server/migrate-json-to-pg.js --schema",
+    "db:migrate": "node server/migrate-json-to-pg.js"
   },
   "dependencies": {
     "@neondatabase/serverless": "1.1.0"
