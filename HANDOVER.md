@@ -52,6 +52,8 @@ Salesforce Marketing Cloud (auth / rest / soap endpoints per tenant subdomain)
 ```
 
 ### Scan pipeline
+A scan is a job in the store, worked through as short, resumable steps (one per BU and module; content is paged over several steps). Each step saves what it collected; the last step merges everything and analyses it. Locally a background loop runs the steps. On Vercel (or `MCNEXUS_SCAN_MODE=poll`) each progress poll from the UI runs one step. A crashed or abandoned step is retried once its 10-minute lease expires.
+
 1. **Organization** — tokenContext plus the SOAP BusinessUnit list (all accounts).
 2. **Security** — the SOAP AccountUser list (enterprise-wide).
 3. **Per Business Unit**, using a BU-scoped token:
@@ -67,7 +69,7 @@ Salesforce Marketing Cloud (auth / rest / soap endpoints per tenant subdomain)
    - score assets, BUs and domains
    - compute coverage
    - derive inventory, limitations, architecture notes and quick wins
-5. **Persist:** the snapshot is written to disk. Compare uses stable finding IDs.
+5. **Persist:** the snapshot is saved to the store (JSON files or PostgreSQL). Compare uses stable finding IDs.
 
 ### Scoring
 Severity weights for health scores: CRIT 10, HIGH 4, MED 1.5, LOW 0.4. The same formula applies to the org, each BU and each domain:
@@ -103,7 +105,7 @@ Coverage is the share of successful collection calls per module.
 | PUT | /api/connections/:id/triage | Persist status, owner, notes, in-report |
 | GET | /api/connections/:id/compare?a=&b= | Added and resolved findings |
 | POST | /api/scans | Start a scan `{connId, mids[], modules[], mode, naming}` |
-| GET | /api/jobs/:id · POST /api/jobs/:id/cancel | Progress polling and cancellation |
+| GET | /api/jobs/:id · POST /api/jobs/:id/cancel | Progress and cancellation. In poll mode each GET also runs the next scan step. Starting a scan while one runs returns 409 with that `jobId` |
 
 ## 6. Rule catalog (v2.1)
 DE-RET-001, DE-PK-001, DE-ORP-001, SQL-001, SQL-007, SQL-TGT-001, SQL-SRC-001, AUTO-FAIL-002, AUTO-STL-001, AUTO-EMP-001, JRN-COR-004, JRN-ENT-001, JRN-VER-002, CP-002, SEC-SCR-001, USR-INA-001, CNT-REF-002, CNT-DE-001, GOV-NAM-001.
@@ -125,7 +127,9 @@ Severity overrides and enable/disable are set in **Admin → Rules** and apply f
 - **Not collected in this version:** send/open tracking and row-level data (for example, duplicate rates).
 - **Limits for large orgs:** capped by `MCNEXUS_MAX_PAGES` and `MCNEXUS_MAX_DETAIL`. When a cap is hit, coverage is marked PARTIAL. The UI shows the first 400 findings or assets per filter.
 - **Deployment:**
-  - Scan jobs are in memory, so it runs as a single process. Storage can be JSON files (laptop or single VM) or PostgreSQL (`DATABASE_URL`, Neon). See "Moving to PostgreSQL" in server/README.md.
+  - Storage can be JSON files (laptop or single VM) or PostgreSQL (`DATABASE_URL`, Neon). See "Moving to PostgreSQL" in server/README.md. With JSON storage, run a single process.
+  - In poll mode (Vercel) a scan advances only while the progress screen is open. If the tab is closed, the scan pauses; starting a scan for that org again re-attaches to it and carries on.
+  - The final analysis step holds the whole org in memory, as before, and each step must fit the function time limit. Very large Business Units may need a higher Vercel `maxDuration`.
   - For multi-user hosting, put TLS in front.
 - **Report formats:** PDF uses the browser print dialog. "Excel" exports CSV (UTF-8 with BOM).
 

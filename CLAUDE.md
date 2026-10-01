@@ -8,7 +8,7 @@ MCNexus is a read-only assessment tool for Salesforce Marketing Cloud Engagement
 ## Layout
 - `MCNexus App.dc.html` — **the product UI.** One Design Component: a template plus a `class Component extends DCLogic` logic block. Opens directly in a browser.
 - `support.js` — DC runtime. Never edit by hand.
-- `server/mcnexus-server.js` — **the backend.** Node 22+. Serves the UI, handles auth and sessions, calls SFMC, runs the rules.
+- `server/mcnexus-server.js` — **the backend.** Node 22+. Serves the UI, handles auth and sessions, calls SFMC, runs the rules. Scans are resumable jobs: `STEPS` (one per BU × module, content paged across steps) run by `runStep()`, which holds a lease. A step must be idempotent: it collects into its own part and never mutates earlier parts. New collection goes into a step plus the plan built in `STEPS.org`.
 - `server/store.js` — the storage contract (documented at the top) and `JsonStore` (default). `server/store-pg.js` — `PgStore` for PostgreSQL/Neon, chosen when `DATABASE_URL` is set. Routes only talk to `store`; never read or write files or SQL from a route.
 - `server/schema.sql` — PostgreSQL schema. Idempotent; each statement ends with `;` at end of line and contains no other `;` (the Neon HTTP driver runs them one by one). Change it by appending, and bump `schema_version` / `SCHEMA_VERSION`.
 - `server/migrate-json-to-pg.js` — installs the schema and copies a JSON data folder into PostgreSQL.

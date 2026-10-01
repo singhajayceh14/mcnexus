@@ -49,6 +49,7 @@ Not collected: installed packages (no public API), send/open tracking, and row-l
 - `MCNEXUS_SESSION_IDLE_H` (8) and `MCNEXUS_SESSION_MAX_H` (168): session idle timeout and absolute lifetime, in hours.
 - `MCNEXUS_LOGIN_MAX` (10) and `MCNEXUS_LOGIN_MAX_IP` (50): failed sign-ins allowed per email and per client IP in 15 minutes before sign-in returns 429.
 - `MCNEXUS_TRUST_PROXY`: set to `1` behind a proxy that sets `X-Forwarded-For` and `X-Forwarded-Proto` (Vercel, nginx, Caddy). The client IP and HTTPS detection then come from those headers. Leave it unset when clients connect directly — otherwise they could spoof their IP.
+- `MCNEXUS_SCAN_MODE`: `background` (default) runs a scan in the server process from start to finish. `poll` runs one scan step per progress request instead, for serverless hosts where nothing may run after a response; it is the default when `VERCEL` is set. Either way the scan is stored as a job, so a restart or crash doesn't lose it: starting a scan for that org again resumes it.
 
 ## Security
 
