@@ -84,6 +84,7 @@
         <span class="tag tag-outline">Read-only</span>
       </div>
       <div style="margin-left:auto; display:flex; align-items:center; gap:10px; font-size:13px;">
+        <sc-if value="{{ scanBadge.show }}" hint-placeholder-val="{{ false }}"><button class="btn btn-secondary" onClick="{{ scanBadge.open }}" aria-label="{{ scanBadge.aria }}" style="padding:4px 10px; display:inline-flex; align-items:center; gap:8px;"><span style="width:8px; height:8px; background:var(--color-accent);"></span>{{ scanBadge.label }}</button></sc-if>
         <span data-user="1" style="display:flex; align-items:center; gap:8px; color:var(--color-neutral-700);"><span style="width:28px; height:28px; display:grid; place-items:center; border:1px solid var(--color-accent); color:var(--color-accent-800); font-family:var(--font-heading); font-weight:600; font-size:13px;">{{ me.initials }}</span>{{ me.label }}</span>
         <button class="btn btn-secondary" onClick="{{ logout }}" style="padding:4px 10px;">Log out</button>
       </div>
@@ -1283,6 +1284,8 @@ class Component extends DCLogic {
       this.setState({ conns, settings: set, sMode: set.scan.mode, sMods: this.modsObj(set.scan.modules), rFormat: set.report.format || 'PDF', rulesX: st.rulesX || {}, ...(st.naming ? { naming: st.naming } : {}), orgId: pick ? pick.id : '', connSel: pick ? pick.id : '' });
       if (pick) await this.loadDataset(pick.id);
       this.go('home');
+      const run = conns.find(c => c.running && pick && c.id === pick.id) || conns.find(c => c.running);
+      if (run) this.watchJob(run.running.jobId, run.running.scanId, run.id, false);
     } catch (e) { this.setState({ loadErr: e.message }); this.go('home'); }
   }
   async refreshConns() { const cs = await this.api('GET', '/api/connections'); this.setState({ conns: cs.connections || [] }); return cs.connections || []; }
@@ -1422,17 +1425,22 @@ class Component extends DCLogic {
     const step = (this.props.scanSpeed === 'slow') ? 0.7 : 1.6;
     this.t1 = setInterval(() => { this.setState(st => { const p = Math.min(100, st.prog + step); if (p >= 100) { clearInterval(this.t1); const has = st.extraScans.length > 0; return { prog: 100, running: false, extraScans: has ? st.extraScans : [{ id: '#005', date: '30 Sep 2026', health: 82, cov: 94, sev: [3, 18, 46, 72, 12], rules: 'v1.2', assets: 4563, mode: st.sMode.split(' ')[0], by: 'R. Mehta', dom: [91, 88, 84, 82, 79, 78, 76, 72, 68] }] }; } return { prog: p }; }); }, 180);
   };
-  // Polls a scan job one request at a time (each poll may run a scan step on the server) until it finishes.
-  watchJob(jobId, scanId, orgId) {
-    this.go('progress', { jobId, job: { scanId, pct: 0, cur: 'Starting', log: [], mods: {}, counts: {}, done: false } });
+  // Follows a scan job one request at a time (each poll may run a scan step on the server) until it finishes.
+  // show: open the progress screen; otherwise watch in the background (header indicator) while the user works.
+  watchJob(jobId, scanId, orgId, show = true) {
+    const job = { scanId, pct: 0, cur: 'Starting', log: [], mods: {}, counts: {}, done: false };
+    if (show) this.go('progress', { jobId, jobOrg: orgId, job }); else this.setState({ jobId, jobOrg: orgId, job });
     clearTimeout(this.t1);
     const poll = async () => {
       try { const j = await this.api('GET', '/api/jobs/' + jobId); this.setState({ job: j });
         if (!j.done) { this.t1 = setTimeout(poll, 1000); return; }
-        await this.refreshConns(); if (!j.error) { await this.loadDataset(orgId); this.say('Scan ' + j.scanId + ' complete'); } else this.say('Scan stopped: ' + j.error); }
-      catch (e) { this.say(e.message); }
+        await this.refreshConns();
+        if (j.error) { this.say('Scan stopped: ' + j.error); return; }
+        if (this.state.orgId === orgId) await this.loadDataset(orgId);   // never switch the org the user is looking at
+        this.say('Scan ' + j.scanId + ' complete'); }
+      catch (e) { if (this.state.screen !== 'login') this.t1 = setTimeout(poll, 5000); }   // e.g. server restarting: keep following
     };
-    this.t1 = setTimeout(poll, 1000);
+    this.t1 = setTimeout(poll, show ? 1000 : 0);
   }
   fetchCompare(a, b) { if (!this.state.live || !a || !b || a === b) { this.setState({ cmpRes: null }); return; } this.api('GET', '/api/connections/' + this.state.orgId + '/compare?a=' + encodeURIComponent(a) + '&b=' + encodeURIComponent(b)).then(r => this.setState({ cmpRes: r })).catch(e => this.say(e.message)); }
   download(name, mime, text) { const b = new Blob([text], { type: mime }); const u = URL.createObjectURL(b); const a = document.createElement('a'); a.href = u; a.download = name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(u), 2000); }
@@ -1834,7 +1842,14 @@ ${o.disclaimer ? `<p><small>${e(o.disclaimer)}</small></p>` : ''}<p><small>Read-
     };
 
     const dataScreens = ['dash', 'findings', 'finding', 'assets', 'deps', 'data', 'org', 'history', 'compare', 'reports'];
+    const sj = s.job, jobConn = conns.find(c => c.id === s.jobOrg);
+    const scanBadge = {
+      show: live && !!s.jobId && !!sj && !sj.done && scr !== 'progress',
+      label: (sj && sj.scanId ? 'Scan ' + sj.scanId : 'Scan') + ' running · ' + ((sj && sj.pct) || 0) + '%' + (jobConn && s.jobOrg !== s.orgId ? ' · ' + jobConn.name : ''),
+      aria: 'Scan running — open progress', open: () => this.go('progress'),
+    };
     return {
+      scanBadge,
       isLogin: scr === 'login', isApp: scr !== 'login' && scr !== 'boot', isBoot: scr === 'boot',
       isDemo: !live, isLive: live, appMode: live ? 'Read-only · live · v' + '1.0' : 'Demo data · server offline', pwHint: live ? (s.firstRun ? 'First sign-in: choose an owner password (8+)' : '') : 'Any 6+ characters',
       showNoData: live && !hasScan && dataScreens.includes(scr), noOrg: live && !conns.length, busy: s.busy, isBusy: !!s.busy, loadErr: s.loadErr, hasLoadErr: !!s.loadErr, me: s.me, dash,
