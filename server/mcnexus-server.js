@@ -741,11 +741,16 @@ async function api(req, res, url) {
   return send(req, res, 404, { error: 'Unknown endpoint' });
 }
 
+// Allow-list of files the UI loads. Everything else (server/, uploads/, docs, dotfiles) is never served.
+// Matched case-sensitively against the normalized path, so case-insensitive file systems can't bypass it.
+const STATIC_OK = /^(?:[^/]+\.dc\.html|support\.js|_ds\/[^/]+\/[^/]+\.(?:css|js|woff2?|ttf|svg|png))$/;
 function serveStatic(req, res, url) {
-  let p = decodeURIComponent(url.pathname);
+  let p; try { p = decodeURIComponent(url.pathname); } catch { return send(req, res, 404, 'Not found'); }
   if (p === '/') { res.writeHead(302, { location: '/' + encodeURIComponent('MCNexus App.dc.html') }); return res.end(); }
-  const f = path.normalize(path.join(ROOT, p));
-  if (!f.startsWith(ROOT + path.sep) || /[\\/](server|uploads)([\\/]|$)|[\\/]\./.test(f.slice(ROOT.length))) return send(req, res, 404, 'Not found');
+  const rel = path.posix.normalize(p.replace(/\\/g, '/')).replace(/^\/+/, '');
+  if (p.includes('\0') || !STATIC_OK.test(rel) || rel.split('/').some(s => s.startsWith('.'))) return send(req, res, 404, 'Not found');
+  const f = path.join(ROOT, rel);
+  if (!f.startsWith(ROOT + path.sep)) return send(req, res, 404, 'Not found');
   fs.stat(f, (e, st) => {
     if (e || !st.isFile()) return send(req, res, 404, 'Not found');
     res.writeHead(200, { 'content-type': MIME[path.extname(f).toLowerCase()] || 'application/octet-stream', 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff' });
