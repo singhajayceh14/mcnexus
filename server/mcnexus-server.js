@@ -758,8 +758,14 @@ function serveStatic(req, res, url) {
   });
 }
 
-http.createServer(async (req, res) => {
+async function handle(req, res) {
   const url = new URL(req.url, 'http://x');
   try { if (url.pathname.startsWith('/api/')) await api(req, res, url); else serveStatic(req, res, url); }
   catch (e) { console.error(e); send(req, res, e.status && e.status < 500 ? 400 : 500, { error: e.message }); }
-}).listen(PORT, HOST, () => console.log(`MCNexus ${VERSION} → http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}/  (data: ${DATA})`));
+}
+
+if (require.main === module) http.createServer(handle).listen(PORT, HOST, () => console.log(`MCNexus ${VERSION} → http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}/  (data: ${DATA})`));
+
+// Internals exported for tests (test/). Set MCNEXUS_DATA / MCNEXUS_KEY before requiring: the store loads on require.
+module.exports = { handle, analyze, runScan, testConnection, SFMC, ApiErr, xmlObj, sqlSources, sqlDepth, patternRe, enc, dec, hid, score,
+  RULES, RULE, RULESET, VERSION, DOMAINS, DOMAIN_OF, MODULES, SEVS, W, PEN, SECRET_RE, STATIC_OK };

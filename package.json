@@ -6,6 +6,7 @@
   "engines": { "node": ">=18" },
   "scripts": {
     "start": "node server/mcnexus-server.js",
-    "check": "node --check server/mcnexus-server.js"
+    "check": "node --check server/mcnexus-server.js",
+    "test": "node --test"
   }
 }

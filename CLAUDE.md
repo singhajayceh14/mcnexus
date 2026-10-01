@@ -53,3 +53,4 @@ Asset keys are `TYPE:MID:id`: DE, SQL, AUTO, IMP, SCR, JRN, CNT. Virtual node ke
 ## Commands
 - Run: `node server/mcnexus-server.js` (or `npm start`), then open http://127.0.0.1:8787
 - Syntax check: `node --check server/mcnexus-server.js`
+- Tests: `npm test` (`node:test`, no dependencies). SFMC is faked in `test/helpers.js`; tests never reach a real org.
