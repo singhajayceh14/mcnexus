@@ -46,11 +46,15 @@ Not collected: installed packages (no public API), send/open tracking, and row-l
 - `MCNEXUS_DATA`: data folder for JSON storage (default `server/data`).
 - `DATABASE_URL`: a Neon connection string. When set, everything is stored in PostgreSQL and nothing is written to disk. Requires `MCNEXUS_KEY`. The Neon serverless HTTP driver is used, so the URL must be a Neon one.
 - `MCNEXUS_MAX_PAGES` (40), `MCNEXUS_MAX_DETAIL` (400), `MCNEXUS_CONCURRENCY` (6): limits for large orgs. When a limit is hit, coverage is marked partial.
+- `MCNEXUS_SESSION_IDLE_H` (8) and `MCNEXUS_SESSION_MAX_H` (168): session idle timeout and absolute lifetime, in hours.
+- `MCNEXUS_LOGIN_MAX` (10) and `MCNEXUS_LOGIN_MAX_IP` (50): failed sign-ins allowed per email and per client IP in 15 minutes before sign-in returns 429.
+- `MCNEXUS_TRUST_PROXY`: set to `1` behind a proxy that sets `X-Forwarded-For` and `X-Forwarded-Proto` (Vercel, nginx, Caddy). The client IP and HTTPS detection then come from those headers. Leave it unset when clients connect directly — otherwise they could spoof their IP.
 
 ## Security
 
 - Client secrets are encrypted at rest with AES-256-GCM and never sent back to the browser.
-- Sessions use an HttpOnly, SameSite=Strict cookie with an 8-hour idle timeout.
+- Sessions use an HttpOnly, SameSite=Strict cookie (plus `Secure` over HTTPS). They are stored server-side by `sha256(token)`, so they survive restarts and a copy of the store can't be used to sign in. Idle timeout 8 hours; absolute lifetime 7 days however active the session is. Changing your password ends your other sessions.
+- Sign-in is throttled per email and per IP. Unknown emails take as long to reject as wrong passwords, so responses don't reveal which accounts exist.
 - All SFMC calls are read-only: `Retrieve`, `GET`, and the asset query `POST`.
 - Back up `server/data/`: it holds connections, scan snapshots and triage. On PostgreSQL, use Neon's point-in-time restore or branches, and keep `MCNEXUS_KEY` somewhere safe — the database alone can't decrypt client secrets.
 

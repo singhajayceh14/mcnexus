@@ -1,15 +1,17 @@
 'use strict';
 // API routes through the real request handler on an ephemeral port, with SFMC faked.
 // Shared by api.test.js (JsonStore) and api-pg.test.js (PgStore on PGlite).
-// setup() → { store, raw: async () => every persisted byte as text, cleanup? }.
+// setup() → { store, reopen: () => a new store on the same data, raw: async () => every persisted byte as text, cleanup? }.
 // Tests run in order and share one server, one store and one session.
 const { describe, test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
+const crypto = require('crypto');
 const { loadServer, fakeSfmc, assertReadOnly, sfmcOrg, startApp, SUB, CID, SEC } = require('./helpers');
 
 module.exports = function apiSuite(label, setup) {
 describe(label, () => {
-const { srv, cleanup } = loadServer();
+// Low sign-in cap so the throttle test is quick; trust X-Forwarded-* like a deployment behind a proxy.
+const { srv, cleanup } = loadServer({ MCNEXUS_LOGIN_MAX: '3', MCNEXUS_TRUST_PROXY: '1' });
 const { DOMAINS, RULES } = srv;
 let app, fake, ctx; const bodies = [];
 const call = async (...a) => { const r = await app.call(...a); bodies.push(r.text); return r; };
@@ -185,9 +187,75 @@ test('clearing scans keeps the connection; deleting removes scans and triage fro
   assert.deepEqual(await ctx.store.getTriage(state.cid), {});
 });
 
+test('sessions survive a restart; only a hash of the token is stored', async () => {
+  const tok = app.cookie().replace(/^mcx=/, '');
+  ctx.store = ctx.reopen(); srv.useStore(ctx.store);   // later tests read through the same instance the server uses
+  assert.equal((await call('GET', '/api/session')).json.user.email, OWNER.email);
+  const raw = await ctx.raw();
+  assert.ok(!raw.includes(tok), 'raw session token in storage');
+  assert.ok(raw.includes(crypto.createHash('sha256').update(tok).digest('hex')));
+});
+
+test('an idle-expired session is rejected and removed', async () => {
+  const mine = app.cookie(), tok = crypto.randomBytes(32).toString('hex'), hash = crypto.createHash('sha256').update(tok).digest('hex'), now = Date.now();
+  await ctx.store.createSession({ hash, email: OWNER.email, created: now - 9 * 3600e3, seen: now - 9 * 3600e3, expires: now - 3600e3, ua: '', ip: '' });
+  app.setCookie('mcx=' + tok);
+  assert.equal((await call('GET', '/api/connections')).status, 401);
+  assert.equal(await ctx.store.getSession(hash), null);
+  app.setCookie(mine);
+});
+
+test('activity slides the idle expiry but never past the absolute lifetime', async () => {
+  const mine = app.cookie(), tok = crypto.randomBytes(32).toString('hex'), hash = crypto.createHash('sha256').update(tok).digest('hex'), now = Date.now();
+  const created = now - srv.SESSION_MAX + 30e3;
+  await ctx.store.createSession({ hash, email: OWNER.email, created, seen: now - 5 * 60e3, expires: created + srv.SESSION_MAX, ua: '', ip: '' });
+  app.setCookie('mcx=' + tok);
+  assert.equal((await call('GET', '/api/connections')).status, 200);
+  const x = await ctx.store.getSession(hash);
+  assert.ok(x.seen >= now, 'last seen updated');
+  assert.equal(x.expires, created + srv.SESSION_MAX, 'capped at the absolute lifetime, not now + idle');
+  await ctx.store.deleteSession(hash);
+  app.setCookie(mine);
+});
+
+test('sessions list shows every device; sign out others ends the rest', async () => {
+  const other = await startApp(srv.handle); try {
+  await other.call('POST', '/api/login', OWNER, { 'user-agent': 'OtherDevice/1.0', 'x-forwarded-for': '203.0.113.9' });
+  const list = (await call('GET', '/api/me/sessions')).json.sessions;
+  assert.equal(list.filter(x => x.current).length, 1);
+  const o = list.find(x => x.ua === 'OtherDevice/1.0');
+  assert.ok(o && !o.current && o.ip === '203.0.113.9', JSON.stringify(list));
+  assert.ok(typeof o.created === 'number' && typeof o.seen === 'number');
+  assert.ok((await call('POST', '/api/me/signout-others')).json.ended >= 1);
+  assert.equal((await other.call('GET', '/api/connections')).status, 401);
+  assert.deepEqual((await call('GET', '/api/me/sessions')).json.sessions.map(x => x.current), [true]);
+  } finally { await other.close(); }
+});
+
+test('sign-in is throttled per email after repeated failures', async () => {
+  const c = await startApp(srv.handle); try {
+  for (let i = 0; i < 3; i++) assert.equal((await c.call('POST', '/api/login', { email: OWNER.email, password: 'wrong-' + i })).status, 401);
+  const r = await c.call('POST', '/api/login', OWNER);
+  assert.equal(r.status, 429, 'blocked even with the right password');
+  assert.ok(+r.headers.get('retry-after') > 0);
+  assert.match(r.json.error, /Too many sign-in attempts/);
+  await ctx.store.clearFailures('email:' + OWNER.email);
+  assert.equal((await c.call('POST', '/api/login', OWNER)).status, 200);
+  } finally { await c.close(); }
+});
+
+test('cookie gets Secure only over HTTPS (here via a trusted proxy)', async () => {
+  const c = await startApp(srv.handle); try {
+  assert.doesNotMatch((await c.call('POST', '/api/login', OWNER)).headers.get('set-cookie'), /Secure/);
+  assert.match((await c.call('POST', '/api/login', OWNER, { 'x-forwarded-proto': 'https' })).headers.get('set-cookie'), /; Secure$/);
+  } finally { await c.close(); }
+});
+
 test('logout ends the session', async () => {
+  const hash = crypto.createHash('sha256').update(app.cookie().replace(/^mcx=/, '')).digest('hex');
   assert.equal((await call('POST', '/api/logout')).status, 200);
   assert.equal((await call('GET', '/api/connections')).status, 401);
+  assert.equal(await ctx.store.getSession(hash), null, 'removed from storage');
 });
 
 test('no response ever carried the client secret, and SFMC was only read', () => {

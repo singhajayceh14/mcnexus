@@ -188,7 +188,7 @@ async function pgliteAdapter() {
   };
 }
 const SCHEMA = () => fs.readFileSync(path.join(__dirname, '..', 'server', 'schema.sql'), 'utf8');
-const PG_TABLES = ['password_reset', 'invite', 'app_session', 'triage', 'scan_snapshot', 'scan', 'connection', 'app_setting', 'app_user'];
+const PG_TABLES = ['login_attempt', 'password_reset', 'invite', 'app_session', 'triage', 'scan_snapshot', 'scan', 'connection', 'app_setting', 'app_user'];
 // Every persisted row as text — used to prove secrets never land in storage in plaintext.
 const pgDump = async (adapter) => { let out = ''; for (const t of PG_TABLES) out += t + ':' + JSON.stringify(await adapter.query(`SELECT * FROM ${t}`, [])) + '\n'; return out; };
 const jsonDump = (dir) => { let out = ''; const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).forEach(e => { const f = path.join(d, e.name); if (e.isDirectory()) walk(f); else out += fs.readFileSync(f, 'utf8') + '\n'; }); walk(dir); return out; };
@@ -199,15 +199,15 @@ const newJob = () => ({ connId: 'c-test', scanId: '#001', n: 1, t0: Date.now(), 
 async function startApp(handle) {
   const s = http.createServer(handle); await new Promise(r => s.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${s.address().port}`; let cookie = '';
-  const call = async (method, p, body) => {
-    const r = await fetch(base + p, { method, redirect: 'manual', headers: { ...(body ? { 'content-type': 'application/json' } : {}), ...(cookie ? { cookie } : {}) }, body: body ? JSON.stringify(body) : undefined });
+  const call = async (method, p, body, headers = {}) => {
+    const r = await fetch(base + p, { method, redirect: 'manual', headers: { ...(body ? { 'content-type': 'application/json' } : {}), ...(cookie ? { cookie } : {}), ...headers }, body: body ? JSON.stringify(body) : undefined });
     const sc = r.headers.get('set-cookie'); if (sc) cookie = sc.split(';')[0];
     const text = await r.text(); let json = null; try { json = JSON.parse(text); } catch { }
     return { status: r.status, json, text, headers: r.headers };
   };
   // Sends the path exactly as given (fetch would normalise `..` and backslashes away).
   const raw = (p) => new Promise((ok, bad) => http.get({ host: '127.0.0.1', port: s.address().port, path: p }, (res) => { res.resume(); res.on('end', () => ok(res.statusCode)); }).on('error', bad));
-  return { base, call, raw, setCookie: (c) => { cookie = c; }, close: () => { s.closeAllConnections && s.closeAllConnections(); return new Promise(r => s.close(r)); } };
+  return { base, call, raw, cookie: () => cookie, setCookie: (c) => { cookie = c; }, close: () => { s.closeAllConnections && s.closeAllConnections(); return new Promise(r => s.close(r)); } };
 }
 
 module.exports = { SUB, CID, SEC, RECENT, OLD, loadServer, fakeSfmc, assertReadOnly, sfmcOrg, newJob, startApp, pgliteAdapter, SCHEMA, PG_TABLES, pgDump, jsonDump };

@@ -40,7 +40,7 @@ Browser (MCNexus App.dc.html)
    │  same-origin fetch, HttpOnly session cookie
    ▼
 Node server (server/mcnexus-server.js)
-   ├─ Auth: scrypt passwords, in-memory sessions (8h idle)
+   ├─ Auth: scrypt passwords; sessions in the store, keyed by sha256(token) (8h idle, 7-day absolute); sign-in throttling
    ├─ Store (server/store.js): one async contract, two backends
    │    JSON (default): server/data/store.json + scans/<connId>/<n>.json
    │    PostgreSQL (DATABASE_URL, Neon): server/store-pg.js + server/schema.sql
@@ -125,7 +125,6 @@ Severity overrides and enable/disable are set in **Admin → Rules** and apply f
 - **Not collected in this version:** send/open tracking and row-level data (for example, duplicate rates).
 - **Limits for large orgs:** capped by `MCNEXUS_MAX_PAGES` and `MCNEXUS_MAX_DETAIL`. When a cap is hit, coverage is marked PARTIAL. The UI shows the first 400 findings or assets per filter.
 - **Deployment:**
-  - Sessions are in-memory, so a restart signs users out.
   - Scan jobs are in memory, so it runs as a single process. Storage can be JSON files (laptop or single VM) or PostgreSQL (`DATABASE_URL`, Neon). See "Moving to PostgreSQL" in server/README.md.
   - For multi-user hosting, put TLS in front.
 - **Report formats:** PDF uses the browser print dialog. "Excel" exports CSV (UTF-8 with BOM).
@@ -134,7 +133,7 @@ Severity overrides and enable/disable are set in **Admin → Rules** and apply f
 1. Run a first scan against a sandbox. Fix any field-shape issues reported in the scan log.
 2. Add automation run history (the legacy automation instance endpoints) to strengthen AUTO-FAIL-002 and JRN-COR-004.
 3. Add user role retrieval (SOAP Role / AccountUser roles) to restore admin-specific inactivity checks.
-4. Add persistent sessions and multi-user roles (Owner / Admin / Consultant / Viewer). PostgreSQL storage is done; its schema already has the session, invite and password-reset tables.
+4. Add multi-user roles (Owner / Admin / Consultant / Viewer), invites and password reset. PostgreSQL storage and persistent sessions are done; the schema already has the invite and password-reset tables.
 5. Add CI (GitHub Actions) that runs `npm ci && npm test` on every push. The test suites exist (`test/`).
 
 ## 9. Operations

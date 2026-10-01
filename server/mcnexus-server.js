@@ -10,7 +10,13 @@ const RULESET = '2.1', VERSION = '1.0.0';
 const ENV_LIM = { maxPages: +process.env.MCNEXUS_MAX_PAGES || 40, maxDetail: +process.env.MCNEXUS_MAX_DETAIL || 400, concurrency: +process.env.MCNEXUS_CONCURRENCY || 6 };
 let MAX_PAGES = ENV_LIM.maxPages, MAX_DETAIL = ENV_LIM.maxDetail, CONCURRENCY = ENV_LIM.concurrency; // overridden by Settings → Scan defaults
 const STARTED = Date.now();
-const SESSION_IDLE = 8 * 3600e3;
+// Sessions: idle timeout, absolute lifetime, and how often last-seen is written back (keeps writes off hot paths).
+const HOURS = (v, d) => (+v > 0 ? +v : d) * 3600e3;
+const SESSION_IDLE = HOURS(process.env.MCNEXUS_SESSION_IDLE_H, 8), SESSION_MAX = HOURS(process.env.MCNEXUS_SESSION_MAX_H, 168), SESSION_TOUCH = 60e3;
+// Sign-in throttling: failures per email and per client IP in a 15-minute window.
+const LOGIN_WINDOW = 15 * 60e3, LOGIN_MAX_EMAIL = +process.env.MCNEXUS_LOGIN_MAX || 10, LOGIN_MAX_IP = +process.env.MCNEXUS_LOGIN_MAX_IP || 50;
+// Behind a proxy (Vercel, nginx) the client IP and scheme come from X-Forwarded-For / X-Forwarded-Proto.
+const TRUST_PROXY = process.env.MCNEXUS_TRUST_PROXY === '1';
 const PG = !!process.env.DATABASE_URL;
 
 // ---------- crypto / store ----------
@@ -611,7 +617,6 @@ function analyze(M, o) {
 }
 
 // ---------- HTTP ----------
-const sessions = new Map();
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.jsx': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.woff2': 'font/woff2', '.woff': 'font/woff', '.ttf': 'font/ttf', '.md': 'text/plain; charset=utf-8' };
 function send(req, res, code, obj, headers = {}) {
   let body = typeof obj === 'string' || Buffer.isBuffer(obj) ? obj : JSON.stringify(obj);
@@ -621,7 +626,25 @@ function send(req, res, code, obj, headers = {}) {
 }
 const readBody = (req) => new Promise((ok, bad) => { let n = 0; const c = []; req.on('data', d => { n += d.length; if (n > 2e6) { bad(new Error('Body too large')); req.destroy(); } else c.push(d); }); req.on('end', () => { try { ok(c.length ? JSON.parse(Buffer.concat(c).toString('utf8')) : {}); } catch { bad(new Error('Invalid JSON')); } }); });
 const cookie = (req, k) => ((req.headers.cookie || '').split(/;\s*/).find(c => c.startsWith(k + '=')) || '').slice(k.length + 1);
-const session = (req) => { const s = sessions.get(cookie(req, 'mcx')); if (!s || s.exp < Date.now()) return null; s.exp = Date.now() + SESSION_IDLE; s.seen = Date.now(); return s; };
+const tokHash = (t) => crypto.createHash('sha256').update(t).digest('hex');
+const clientIp = (req) => (TRUST_PROXY && String(req.headers['x-forwarded-for'] || '').split(',')[0].trim()) || req.socket.remoteAddress || '';
+const isHttps = (req) => !!req.socket.encrypted || (TRUST_PROXY && /^https$/i.test(String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim()));
+const sessionCookie = (req, tok, maxAge) => `mcx=${tok}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}` + (isHttps(req) ? '; Secure' : '');
+// Valid session for the request's cookie, or null. Slides the idle expiry, never past created + SESSION_MAX.
+async function session(req) {
+  const tok = cookie(req, 'mcx'); if (!/^[0-9a-f]{64}$/.test(tok)) return null;
+  const hash = tokHash(tok), s = await store.getSession(hash), now = Date.now();
+  if (!s) return null;
+  if (s.expires <= now) { await store.deleteSession(hash); return null; }
+  if (now - s.seen >= SESSION_TOUCH) { s.seen = now; s.expires = Math.min(now + SESSION_IDLE, s.created + SESSION_MAX); await store.touchSession(hash, s.seen, s.expires); }
+  return s;
+}
+async function startSession(req, email) {
+  const tok = crypto.randomBytes(32).toString('hex'), now = Date.now();
+  await store.createSession({ hash: tokHash(tok), email, created: now, seen: now, expires: now + Math.min(SESSION_IDLE, SESSION_MAX), ua: String(req.headers['user-agent'] || '').slice(0, 300), ip: clientIp(req) });
+  await store.purgeExpired(now);
+  return sessionCookie(req, tok, Math.floor(SESSION_MAX / 1000));
+}
 const subOk = (s) => /^[a-z0-9-]{10,60}$/.test(s || '');
 const parseSub = (v) => { const t = String(v || '').trim().toLowerCase(); const m = t.match(/^https?:\/\/([a-z0-9-]+)\.(auth|rest|soap)\.marketingcloudapis\.com/); return m ? m[1] : t.replace(/[^a-z0-9-]/g, ''); };
 
@@ -633,14 +656,19 @@ function publicConn(c, list = []) {
 const pubConn = async (c) => publicConn(c, await store.listScans(c.id));
 const stamp = () => fmtD(new Date()) + ' ' + new Date().toTimeString().slice(0, 5);
 const pwOk = (u, pw) => crypto.timingSafeEqual(Buffer.from(hashPw(pw, u.salt), 'hex'), Buffer.from(u.hash, 'hex'));
+// Unknown emails still pay for one scrypt, so response time doesn't reveal which accounts exist.
+const NO_USER = { salt: '00'.repeat(16), hash: '00'.repeat(64) };
 
 async function api(req, res, url) {
   const p = url.pathname, m = req.method;
   if (p === '/api/health') return send(req, res, 200, { ok: true, version: VERSION, ruleset: RULESET, firstRun: (await store.countUsers()) === 0 });
-  if (p === '/api/session') { const s = session(req); const u = s && await store.getUser(s.email); return send(req, res, 200, { user: u ? { email: u.email, name: u.name, role: u.role } : null }); }
+  if (p === '/api/session') { const s = await session(req); const u = s && await store.getUser(s.email); return send(req, res, 200, { user: u ? { email: u.email, name: u.name, role: u.role } : null }); }
   if (p === '/api/login' && m === 'POST') {
     const b = await readBody(req); const email = String(b.email || '').trim().toLowerCase(), pw = String(b.password || '');
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return send(req, res, 400, { error: 'Enter a valid work email.' });
+    const now = Date.now(), keys = ['email:' + email, 'ip:' + clientIp(req)], caps = [LOGIN_MAX_EMAIL, LOGIN_MAX_IP];
+    const over = (await Promise.all(keys.map(k => store.countFailures(k, now, LOGIN_WINDOW)))).filter((f, i) => f.count >= caps[i]);
+    if (over.length) { const wait = Math.max(1, Math.ceil((Math.max(...over.map(f => f.resetAt)) - now) / 1000)); return send(req, res, 429, { error: 'Too many sign-in attempts. Try again in ' + Math.ceil(wait / 60) + ' min.' }, { 'retry-after': String(wait) }); }
     let u = await store.getUser(email);
     if ((await store.countUsers()) === 0) {
       if (pw.length < 8) return send(req, res, 400, { error: 'First sign-in creates the owner account — choose a password of 8+ characters.' });
@@ -648,12 +676,16 @@ async function api(req, res, url) {
       u = { email, name: email.split('@')[0].replace(/[._-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()), role: 'Owner', salt, hash: hashPw(pw, salt) };
       if (!(await store.createFirstOwner(u))) { await sleep(600); return send(req, res, 401, { error: 'Email or password not recognised.' }); }   // lost a first-run race
     }
-    else if (!u || !pwOk(u, pw)) { await sleep(600); return send(req, res, 401, { error: 'Email or password not recognised.' }); }
-    const tok = crypto.randomBytes(32).toString('hex'); sessions.set(tok, { email, exp: Date.now() + SESSION_IDLE, created: Date.now(), seen: Date.now(), ua: String(req.headers['user-agent'] || '').slice(0, 300), ip: req.socket.remoteAddress || '' });
-    return send(req, res, 200, { user: { email: u.email, name: u.name, role: u.role } }, { 'set-cookie': `mcx=${tok}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_IDLE / 1000}` });
+    else if (!pwOk(u || NO_USER, pw) || !u) {
+      await Promise.all(keys.map(k => store.recordFailure(k, Date.now(), LOGIN_WINDOW)));
+      await sleep(600); return send(req, res, 401, { error: 'Email or password not recognised.' });
+    }
+    else await store.clearFailures(keys[0]);
+
+    return send(req, res, 200, { user: { email: u.email, name: u.name, role: u.role } }, { 'set-cookie': await startSession(req, email) });
   }
-  if (p === '/api/logout') { sessions.delete(cookie(req, 'mcx')); return send(req, res, 200, { ok: true }, { 'set-cookie': 'mcx=; Path=/; Max-Age=0' }); }
-  const s = session(req); if (!s) return send(req, res, 401, { error: 'Not signed in' });
+  if (p === '/api/logout') { const tok = cookie(req, 'mcx'); if (/^[0-9a-f]{64}$/.test(tok)) await store.deleteSession(tokHash(tok)); return send(req, res, 200, { ok: true }, { 'set-cookie': sessionCookie(req, '', 0) }); }
+  const s = await session(req); if (!s) return send(req, res, 401, { error: 'Not signed in' });
   const me = (await store.getUser(s.email)) || { name: s.email };
 
   if (p === '/api/settings') {
@@ -673,11 +705,11 @@ async function api(req, res, url) {
     if (!pwOk(u, String(b.current || ''))) { await sleep(600); return send(req, res, 400, { error: 'Current password is not correct.' }); }
     if (String(b.next || '').length < 8) return send(req, res, 400, { error: 'New password must be 8+ characters.' });
     const salt = crypto.randomBytes(16).toString('hex'); await store.setPassword(u.email, salt, hashPw(String(b.next), salt));
-    const cur = cookie(req, 'mcx'); for (const [k, v] of sessions) if (v.email === s.email && k !== cur) sessions.delete(k);
+    await store.deleteSessions(s.email, s.hash);
     return send(req, res, 200, { ok: true });
   }
-  if (p === '/api/me/sessions') { const cur = cookie(req, 'mcx'); return send(req, res, 200, { sessions: [...sessions.entries()].filter(([, v]) => v.email === s.email && v.exp > Date.now()).map(([k, v]) => ({ id: hid(k), current: k === cur, created: v.created, seen: v.seen, ua: v.ua || '', ip: v.ip || '' })) }); }
-  if (p === '/api/me/signout-others' && m === 'POST') { const cur = cookie(req, 'mcx'); let n = 0; for (const [k, v] of sessions) if (v.email === s.email && k !== cur) { sessions.delete(k); n++; } return send(req, res, 200, { ended: n }); }
+  if (p === '/api/me/sessions') { const now = Date.now(); return send(req, res, 200, { sessions: (await store.listSessions(s.email)).filter(x => x.expires > now).map(x => ({ id: x.hash.slice(0, 6).toUpperCase(), current: x.hash === s.hash, created: x.created, seen: x.seen, ua: x.ua || '', ip: x.ip || '' })) }); }
+  if (p === '/api/me/signout-others' && m === 'POST') return send(req, res, 200, { ended: await store.deleteSessions(s.email, s.hash) });
   if (p === '/api/about') {
     const st = await store.stats(), up = Math.floor((Date.now() - STARTED) / 1000), size = st.bytes;
     return send(req, res, 200, { version: VERSION, ruleset: RULESET, node: process.version, platform: process.platform + ' ' + process.arch, started: new Date(STARTED).toISOString(), uptime: Math.floor(up / 86400) + 'd ' + Math.floor(up % 86400 / 3600) + 'h ' + Math.floor(up % 3600 / 60) + 'm', storage: PG ? 'PostgreSQL' : 'JSON files', dataDir: st.location, dataSize: size > 1e6 ? (size / 1e6).toFixed(1) + ' MB' : Math.ceil(size / 1e3) + ' KB', connections: st.connections, scans: st.scans, users: st.users, keySource: process.env.MCNEXUS_KEY ? 'MCNEXUS_KEY environment variable' : 'server/data/.key (generated)', listen: HOST + ':' + PORT });
@@ -809,5 +841,5 @@ async function handle(req, res) {
 if (require.main === module) http.createServer(handle).listen(PORT, HOST, () => console.log(`MCNexus ${VERSION} → http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}/  (storage: ${PG ? 'PostgreSQL' : DATA})`));
 
 // Internals exported for tests (test/). Set MCNEXUS_DATA / MCNEXUS_KEY before requiring: the store loads on require.
-module.exports = { handle, useStore, withDefaults, analyze, runScan, testConnection, SFMC, ApiErr, xmlObj, sqlSources, sqlDepth, patternRe, enc, dec, hid, score,
+module.exports = { handle, useStore, withDefaults, SESSION_IDLE, SESSION_MAX, analyze, runScan, testConnection, SFMC, ApiErr, xmlObj, sqlSources, sqlDepth, patternRe, enc, dec, hid, score,
   RULES, RULE, RULESET, VERSION, DOMAINS, DOMAIN_OF, MODULES, SEVS, W, PEN, SECRET_RE, STATIC_OK };
