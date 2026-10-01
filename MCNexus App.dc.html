@@ -1408,14 +1408,12 @@ class Component extends DCLogic {
       if (!bus.length) { this.say('Select at least one Business Unit.'); return; }
       try {
         const r = await this.api('POST', '/api/scans', { connId: s.orgId, mids: bus.map(b => b.mid), modules: this.modsFor(s), mode: s.sMode, naming: s.naming });
-        this.go('progress', { jobId: r.jobId, job: { scanId: r.scanId, pct: 0, cur: 'Starting', log: [], mods: {}, counts: {}, done: false } });
-        clearInterval(this.t1);
-        this.t1 = setInterval(async () => {
-          try { const j = await this.api('GET', '/api/jobs/' + r.jobId); this.setState({ job: j });
-            if (j.done) { clearInterval(this.t1); await this.refreshConns(); if (!j.error) { await this.loadDataset(s.orgId); this.say('Scan ' + j.scanId + ' complete'); } else this.say('Scan stopped: ' + j.error); } }
-          catch (e) { clearInterval(this.t1); this.say(e.message); }
-        }, 1000);
-      } catch (e) { this.say(e.message); }
+        this.watchJob(r.jobId, r.scanId, s.orgId);
+      } catch (e) {
+        // A scan is already running for this org (another tab, or one interrupted earlier): show it. Polling also resumes it.
+        if (e.data && e.data.jobId) { this.say('A scan is already running for this org — showing its progress'); this.watchJob(e.data.jobId, '', s.orgId); }
+        else this.say(e.message);
+      }
       return;
     }
     const bus = this.D.bus.filter(b => s.sBus[b.mid] !== false);
@@ -1424,6 +1422,18 @@ class Component extends DCLogic {
     const step = (this.props.scanSpeed === 'slow') ? 0.7 : 1.6;
     this.t1 = setInterval(() => { this.setState(st => { const p = Math.min(100, st.prog + step); if (p >= 100) { clearInterval(this.t1); const has = st.extraScans.length > 0; return { prog: 100, running: false, extraScans: has ? st.extraScans : [{ id: '#005', date: '30 Sep 2026', health: 82, cov: 94, sev: [3, 18, 46, 72, 12], rules: 'v1.2', assets: 4563, mode: st.sMode.split(' ')[0], by: 'R. Mehta', dom: [91, 88, 84, 82, 79, 78, 76, 72, 68] }] }; } return { prog: p }; }); }, 180);
   };
+  // Polls a scan job one request at a time (each poll may run a scan step on the server) until it finishes.
+  watchJob(jobId, scanId, orgId) {
+    this.go('progress', { jobId, job: { scanId, pct: 0, cur: 'Starting', log: [], mods: {}, counts: {}, done: false } });
+    clearTimeout(this.t1);
+    const poll = async () => {
+      try { const j = await this.api('GET', '/api/jobs/' + jobId); this.setState({ job: j });
+        if (!j.done) { this.t1 = setTimeout(poll, 1000); return; }
+        await this.refreshConns(); if (!j.error) { await this.loadDataset(orgId); this.say('Scan ' + j.scanId + ' complete'); } else this.say('Scan stopped: ' + j.error); }
+      catch (e) { this.say(e.message); }
+    };
+    this.t1 = setTimeout(poll, 1000);
+  }
   fetchCompare(a, b) { if (!this.state.live || !a || !b || a === b) { this.setState({ cmpRes: null }); return; } this.api('GET', '/api/connections/' + this.state.orgId + '/compare?a=' + encodeURIComponent(a) + '&b=' + encodeURIComponent(b)).then(r => this.setState({ cmpRes: r })).catch(e => this.say(e.message)); }
   download(name, mime, text) { const b = new Blob([text], { type: mime }); const u = URL.createObjectURL(b); const a = document.createElement('a'); a.href = u; a.download = name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(u), 2000); }
   reportHtml(o) {
