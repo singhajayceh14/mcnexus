@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// MCNexus server — zero-dependency (Node 18+). Serves the app and proxies read-only SFMC API calls.
+// MCNexus server (Node 22+). Serves the app and proxies read-only SFMC API calls. Storage: server/store.js.
 'use strict';
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto'), zlib = require('zlib');
+const { createStore } = require('./store');
 
 const PORT = +process.env.PORT || 8787, HOST = process.env.HOST || '127.0.0.1';
 const ROOT = path.resolve(__dirname, '..'), DATA = process.env.MCNEXUS_DATA || path.join(__dirname, 'data');
@@ -10,11 +11,13 @@ const ENV_LIM = { maxPages: +process.env.MCNEXUS_MAX_PAGES || 40, maxDetail: +pr
 let MAX_PAGES = ENV_LIM.maxPages, MAX_DETAIL = ENV_LIM.maxDetail, CONCURRENCY = ENV_LIM.concurrency; // overridden by Settings → Scan defaults
 const STARTED = Date.now();
 const SESSION_IDLE = 8 * 3600e3;
-fs.mkdirSync(path.join(DATA, 'scans'), { recursive: true });
+const PG = !!process.env.DATABASE_URL;
 
 // ---------- crypto / store ----------
 const KEY = (() => {
-  if (process.env.MCNEXUS_KEY) return Buffer.from(process.env.MCNEXUS_KEY, 'hex');
+  if (process.env.MCNEXUS_KEY) { const k = Buffer.from(process.env.MCNEXUS_KEY, 'hex'); if (k.length !== 32) throw new Error('MCNEXUS_KEY must be 64 hex characters (32 bytes).'); return k; }
+  if (PG) throw new Error('MCNEXUS_KEY is required when DATABASE_URL is set: the encryption key never goes into the database.');
+  fs.mkdirSync(DATA, { recursive: true });
   const f = path.join(DATA, '.key');
   if (!fs.existsSync(f)) fs.writeFileSync(f, crypto.randomBytes(32).toString('hex'), { mode: 0o600 });
   return Buffer.from(fs.readFileSync(f, 'utf8').trim(), 'hex');
@@ -23,20 +26,20 @@ const enc = (t) => { const iv = crypto.randomBytes(12), c = crypto.createCipheri
 const dec = (s) => { const [iv, tag, d] = s.split('.').map(x => Buffer.from(x, 'base64')); const c = crypto.createDecipheriv('aes-256-gcm', KEY, iv); c.setAuthTag(tag); return Buffer.concat([c.update(d), c.final()]).toString('utf8'); };
 const hashPw = (pw, salt) => crypto.scryptSync(pw, salt, 64).toString('hex');
 
-const STORE = path.join(DATA, 'store.json');
-let db = fs.existsSync(STORE) ? JSON.parse(fs.readFileSync(STORE, 'utf8')) : {};
-db = { users: [], connections: [], scans: {}, triage: {}, settings: { rulesX: {}, naming: null }, ...db };
-db.settings = { rulesX: {}, naming: null, ...db.settings };
-db.settings.scan = { mode: 'Full Assessment', modules: null, maxPages: ENV_LIM.maxPages, maxDetail: ENV_LIM.maxDetail, concurrency: ENV_LIM.concurrency, ...(db.settings.scan || {}) };
-db.settings.report = { firm: '', disclaimer: '', format: 'PDF', logo: '', ...(db.settings.report || {}) };
-db.settings.data = { keepScans: 0, ...(db.settings.data || {}) };
+// JSON files in DATA by default; PostgreSQL when DATABASE_URL is set (server/store.js documents the contract).
+let store = createStore({ dir: DATA }), storeReady = null;
+const ready = () => storeReady || (storeReady = store.init().catch(e => { storeReady = null; throw e; }));
+const useStore = (s) => { store = s; storeReady = null; };   // tests
+
 const clampN = (v, lo, hi, d) => { const n = parseInt(v, 10); return isNaN(n) ? d : Math.min(hi, Math.max(lo, n)); };
-function applyLimits() { const sc = db.settings.scan; sc.maxPages = clampN(sc.maxPages, 1, 500, 40); sc.maxDetail = clampN(sc.maxDetail, 10, 5000, 400); sc.concurrency = clampN(sc.concurrency, 1, 12, 6); MAX_PAGES = sc.maxPages; MAX_DETAIL = sc.maxDetail; CONCURRENCY = sc.concurrency; }
-applyLimits();
-function prune(cid) { const keep = +db.settings.data.keepScans || 0; const list = db.scans[cid] || []; let n = 0; while (keep > 0 && list.length > keep) { const o = list.shift(); n++; try { fs.unlinkSync(scanPath(cid, o.n)); } catch { } } return n; }
-const save = () => { const tmp = STORE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(db, null, 1), { mode: 0o600 }); fs.renameSync(tmp, STORE); };
-const scanPath = (cid, n) => path.join(DATA, 'scans', cid, n + '.json');
-const loadScan = (cid, n) => { try { return JSON.parse(fs.readFileSync(scanPath(cid, n), 'utf8')); } catch { return null; } };
+// Stored settings sections + defaults. Scan limits are clamped here and applied to the client at scan start.
+function withDefaults(raw = {}) {
+  const sc = { mode: 'Full Assessment', modules: null, maxPages: ENV_LIM.maxPages, maxDetail: ENV_LIM.maxDetail, concurrency: ENV_LIM.concurrency, ...(raw.scan || {}) };
+  sc.maxPages = clampN(sc.maxPages, 1, 500, 40); sc.maxDetail = clampN(sc.maxDetail, 10, 5000, 400); sc.concurrency = clampN(sc.concurrency, 1, 12, 6);
+  return { rulesX: raw.rulesX || {}, naming: raw.naming == null ? null : raw.naming, scan: sc, report: { firm: '', disclaimer: '', format: 'PDF', logo: '', ...(raw.report || {}) }, data: { keepScans: 0, ...(raw.data || {}) } };
+}
+const settings = async () => withDefaults(await store.getSettings());
+function applyLimits(sc) { MAX_PAGES = sc.maxPages; MAX_DETAIL = sc.maxDetail; CONCURRENCY = sc.concurrency; }
 
 // ---------- utils ----------
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -397,7 +400,7 @@ async function runScan(job, conn, opts) {
   ['Security', 'Data', 'SQL', 'Automation', 'Journey', 'Content', 'CloudPages'].forEach(m => { if (!mods.has(m)) return; const c = cov[m]; setMod(m, !c.ok ? 'FAILED' : c.fail ? 'PARTIAL' : 'SUCCESS'); });
 
   job.cur = 'Analysis'; setMod('Governance', mods.has('Governance') ? 'RUNNING' : 'SKIPPED');
-  const ds = analyze(M, { bus, allBus, entMid, mods, cov, naming: opts.naming, rulesX: db.settings.rulesX || {}, L, job });
+  const ds = analyze(M, { bus, allBus, entMid, mods, cov, naming: opts.naming, rulesX: opts.rulesX || {}, L, job });
   if (mods.has('Governance')) { mark('Governance', true); setMod('Governance', 'SUCCESS'); }
   return { ds, api };
 }
@@ -622,75 +625,86 @@ const session = (req) => { const s = sessions.get(cookie(req, 'mcx')); if (!s ||
 const subOk = (s) => /^[a-z0-9-]{10,60}$/.test(s || '');
 const parseSub = (v) => { const t = String(v || '').trim().toLowerCase(); const m = t.match(/^https?:\/\/([a-z0-9-]+)\.(auth|rest|soap)\.marketingcloudapis\.com/); return m ? m[1] : t.replace(/[^a-z0-9-]/g, ''); };
 
-function publicConn(c) {
-  const list = db.scans[c.id] || []; const last = list[list.length - 1];
+function publicConn(c, list = []) {
+  const last = list[list.length - 1];
   return { id: c.id, name: c.name, env: c.env, mid: c.mid || '—', sub: c.sub, bus: (c.buList || []).filter(b => !(c.buOff || {})[b.mid]).length || (c.buList || []).length, buList: c.buList || [], buOff: c.buOff || {}, status: c.status || 'Connected', validated: c.validated || '—', access: c.access || [], scopes: c.scopes || [], cidHint: c.cid ? c.cid.slice(0, 4) + '…' + c.cid.slice(-4) : '—', secretUpdated: c.secretUpdated ? fmtD(c.secretUpdated) : (c.created ? fmtD(c.created) : '—'),
     health: last ? last.health : 0, coverage: last ? last.cov : 0, last: last ? last.date : 'Never', scan: last ? last.id : '—', crit: last ? last.sev[0] : 0, high: last ? last.sev[1] : 0, scans: list.length };
 }
+const pubConn = async (c) => publicConn(c, await store.listScans(c.id));
+const stamp = () => fmtD(new Date()) + ' ' + new Date().toTimeString().slice(0, 5);
+const pwOk = (u, pw) => crypto.timingSafeEqual(Buffer.from(hashPw(pw, u.salt), 'hex'), Buffer.from(u.hash, 'hex'));
 
 async function api(req, res, url) {
   const p = url.pathname, m = req.method;
-  if (p === '/api/health') return send(req, res, 200, { ok: true, version: VERSION, ruleset: RULESET, firstRun: db.users.length === 0 });
-  if (p === '/api/session') { const s = session(req); const u = s && db.users.find(x => x.email === s.email); return send(req, res, 200, { user: u ? { email: u.email, name: u.name, role: u.role } : null }); }
+  if (p === '/api/health') return send(req, res, 200, { ok: true, version: VERSION, ruleset: RULESET, firstRun: (await store.countUsers()) === 0 });
+  if (p === '/api/session') { const s = session(req); const u = s && await store.getUser(s.email); return send(req, res, 200, { user: u ? { email: u.email, name: u.name, role: u.role } : null }); }
   if (p === '/api/login' && m === 'POST') {
     const b = await readBody(req); const email = String(b.email || '').trim().toLowerCase(), pw = String(b.password || '');
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return send(req, res, 400, { error: 'Enter a valid work email.' });
-    let u = db.users.find(x => x.email === email);
-    if (!db.users.length) { if (pw.length < 8) return send(req, res, 400, { error: 'First sign-in creates the owner account — choose a password of 8+ characters.' }); const salt = crypto.randomBytes(16).toString('hex'); u = { email, name: email.split('@')[0].replace(/[._-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()), role: 'Owner', salt, hash: hashPw(pw, salt) }; db.users.push(u); save(); }
-    else if (!u || !crypto.timingSafeEqual(Buffer.from(hashPw(pw, u.salt), 'hex'), Buffer.from(u.hash, 'hex'))) { await sleep(600); return send(req, res, 401, { error: 'Email or password not recognised.' }); }
+    let u = await store.getUser(email);
+    if ((await store.countUsers()) === 0) {
+      if (pw.length < 8) return send(req, res, 400, { error: 'First sign-in creates the owner account — choose a password of 8+ characters.' });
+      const salt = crypto.randomBytes(16).toString('hex');
+      u = { email, name: email.split('@')[0].replace(/[._-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()), role: 'Owner', salt, hash: hashPw(pw, salt) };
+      if (!(await store.createFirstOwner(u))) { await sleep(600); return send(req, res, 401, { error: 'Email or password not recognised.' }); }   // lost a first-run race
+    }
+    else if (!u || !pwOk(u, pw)) { await sleep(600); return send(req, res, 401, { error: 'Email or password not recognised.' }); }
     const tok = crypto.randomBytes(32).toString('hex'); sessions.set(tok, { email, exp: Date.now() + SESSION_IDLE, created: Date.now(), seen: Date.now(), ua: String(req.headers['user-agent'] || '').slice(0, 300), ip: req.socket.remoteAddress || '' });
     return send(req, res, 200, { user: { email: u.email, name: u.name, role: u.role } }, { 'set-cookie': `mcx=${tok}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_IDLE / 1000}` });
   }
   if (p === '/api/logout') { sessions.delete(cookie(req, 'mcx')); return send(req, res, 200, { ok: true }, { 'set-cookie': 'mcx=; Path=/; Max-Age=0' }); }
   const s = session(req); if (!s) return send(req, res, 401, { error: 'Not signed in' });
-  const me = db.users.find(x => x.email === s.email) || { name: s.email };
+  const me = (await store.getUser(s.email)) || { name: s.email };
 
   if (p === '/api/settings') {
     if (m === 'PUT') {
-      const b = await readBody(req);
-      if (b.rulesX) db.settings.rulesX = b.rulesX; if (b.naming) db.settings.naming = b.naming;
-      if (b.scan) { const sc = b.scan; db.settings.scan = { ...db.settings.scan, mode: ['Quick Scan', 'Full Assessment', 'Custom Assessment'].includes(sc.mode) ? sc.mode : db.settings.scan.mode, modules: Array.isArray(sc.modules) ? sc.modules.filter(x => MODULES.includes(x)) : null, maxPages: sc.maxPages, maxDetail: sc.maxDetail, concurrency: sc.concurrency }; applyLimits(); }
-      if (b.report) { const r = b.report; if (r.logo && (String(r.logo).length > 400000 || !/^data:image\/(png|jpeg|svg\+xml);base64,/.test(r.logo))) return send(req, res, 400, { error: 'Logo must be a PNG, JPG or SVG under 300 KB.' }); db.settings.report = { firm: String(r.firm || '').slice(0, 120), disclaimer: String(r.disclaimer || '').slice(0, 2000), format: ['PDF', 'Excel', 'HTML'].includes(r.format) ? r.format : 'PDF', logo: r.logo || '' }; }
-      if (b.data) { db.settings.data = { keepScans: clampN(b.data.keepScans, 0, 1000, 0) }; Object.keys(db.scans).forEach(prune); }
-      save();
+      const b = await readBody(req); const cur = await settings(); const patch = {};
+      if (b.rulesX) patch.rulesX = b.rulesX; if (b.naming) patch.naming = b.naming;
+      if (b.scan) { const sc = b.scan; patch.scan = withDefaults({ scan: { ...cur.scan, mode: ['Quick Scan', 'Full Assessment', 'Custom Assessment'].includes(sc.mode) ? sc.mode : cur.scan.mode, modules: Array.isArray(sc.modules) ? sc.modules.filter(x => MODULES.includes(x)) : null, maxPages: sc.maxPages, maxDetail: sc.maxDetail, concurrency: sc.concurrency } }).scan; }
+      if (b.report) { const r = b.report; if (r.logo && (String(r.logo).length > 400000 || !/^data:image\/(png|jpeg|svg\+xml);base64,/.test(r.logo))) return send(req, res, 400, { error: 'Logo must be a PNG, JPG or SVG under 300 KB.' }); patch.report = { firm: String(r.firm || '').slice(0, 120), disclaimer: String(r.disclaimer || '').slice(0, 2000), format: ['PDF', 'Excel', 'HTML'].includes(r.format) ? r.format : 'PDF', logo: r.logo || '' }; }
+      if (b.data) patch.data = { keepScans: clampN(b.data.keepScans, 0, 1000, 0) };
+      if (Object.keys(patch).length) await store.putSettings(patch);
+      if (patch.data) for (const c of await store.listConnections()) await store.pruneScans(c.id, patch.data.keepScans);
     }
-    return send(req, res, 200, { ...db.settings, rules: RULES, modules: MODULES });
+    return send(req, res, 200, { ...(await settings()), rules: RULES, modules: MODULES });
   }
   if (p === '/api/me/password' && m === 'POST') {
-    const b = await readBody(req); const u = db.users.find(x => x.email === s.email); if (!u) return send(req, res, 404, { error: 'User not found' });
-    if (!crypto.timingSafeEqual(Buffer.from(hashPw(String(b.current || ''), u.salt), 'hex'), Buffer.from(u.hash, 'hex'))) { await sleep(600); return send(req, res, 400, { error: 'Current password is not correct.' }); }
+    const b = await readBody(req); const u = await store.getUser(s.email); if (!u) return send(req, res, 404, { error: 'User not found' });
+    if (!pwOk(u, String(b.current || ''))) { await sleep(600); return send(req, res, 400, { error: 'Current password is not correct.' }); }
     if (String(b.next || '').length < 8) return send(req, res, 400, { error: 'New password must be 8+ characters.' });
-    u.salt = crypto.randomBytes(16).toString('hex'); u.hash = hashPw(String(b.next), u.salt); save();
+    const salt = crypto.randomBytes(16).toString('hex'); await store.setPassword(u.email, salt, hashPw(String(b.next), salt));
     const cur = cookie(req, 'mcx'); for (const [k, v] of sessions) if (v.email === s.email && k !== cur) sessions.delete(k);
     return send(req, res, 200, { ok: true });
   }
   if (p === '/api/me/sessions') { const cur = cookie(req, 'mcx'); return send(req, res, 200, { sessions: [...sessions.entries()].filter(([, v]) => v.email === s.email && v.exp > Date.now()).map(([k, v]) => ({ id: hid(k), current: k === cur, created: v.created, seen: v.seen, ua: v.ua || '', ip: v.ip || '' })) }); }
   if (p === '/api/me/signout-others' && m === 'POST') { const cur = cookie(req, 'mcx'); let n = 0; for (const [k, v] of sessions) if (v.email === s.email && k !== cur) { sessions.delete(k); n++; } return send(req, res, 200, { ended: n }); }
   if (p === '/api/about') {
-    let size = 0; const walk = (d) => { try { fs.readdirSync(d, { withFileTypes: true }).forEach(e => { const f = path.join(d, e.name); if (e.isDirectory()) walk(f); else size += fs.statSync(f).size; }); } catch { } }; walk(DATA);
-    const up = Math.floor((Date.now() - STARTED) / 1000);
-    return send(req, res, 200, { version: VERSION, ruleset: RULESET, node: process.version, platform: process.platform + ' ' + process.arch, started: new Date(STARTED).toISOString(), uptime: Math.floor(up / 86400) + 'd ' + Math.floor(up % 86400 / 3600) + 'h ' + Math.floor(up % 3600 / 60) + 'm', dataDir: DATA, dataSize: size > 1e6 ? (size / 1e6).toFixed(1) + ' MB' : Math.ceil(size / 1e3) + ' KB', connections: db.connections.length, scans: Object.values(db.scans).reduce((n, l) => n + l.length, 0), users: db.users.length, keySource: process.env.MCNEXUS_KEY ? 'MCNEXUS_KEY environment variable' : 'server/data/.key (generated)', listen: HOST + ':' + PORT });
+    const st = await store.stats(), up = Math.floor((Date.now() - STARTED) / 1000), size = st.bytes;
+    return send(req, res, 200, { version: VERSION, ruleset: RULESET, node: process.version, platform: process.platform + ' ' + process.arch, started: new Date(STARTED).toISOString(), uptime: Math.floor(up / 86400) + 'd ' + Math.floor(up % 86400 / 3600) + 'h ' + Math.floor(up % 3600 / 60) + 'm', storage: PG ? 'PostgreSQL' : 'JSON files', dataDir: st.location, dataSize: size > 1e6 ? (size / 1e6).toFixed(1) + ' MB' : Math.ceil(size / 1e3) + ' KB', connections: st.connections, scans: st.scans, users: st.users, keySource: process.env.MCNEXUS_KEY ? 'MCNEXUS_KEY environment variable' : 'server/data/.key (generated)', listen: HOST + ':' + PORT });
   }
-  if (p === '/api/connections' && m === 'GET') return send(req, res, 200, { connections: db.connections.map(publicConn) });
+  if (p === '/api/connections' && m === 'GET') return send(req, res, 200, { connections: await Promise.all((await store.listConnections()).map(pubConn)) });
   if (p === '/api/connections/test' && m === 'POST') {
     const b = await readBody(req); const sub = parseSub(b.sub); let sec = b.sec;
-    if (!sec && b.reauth) { const c = db.connections.find(x => x.id === b.reauth); if (c) sec = dec(c.secEnc); }
+    if (!sec && b.reauth) { const c = await store.getConnection(b.reauth); if (c) sec = dec(c.secEnc); }
     if (!subOk(sub) || !b.cid || !sec) return send(req, res, 400, { error: 'Subdomain, Client ID and Client Secret are required.' });
     return send(req, res, 200, await testConnection({ sub, cid: String(b.cid).trim(), sec: String(sec).trim(), mid: String(b.mid || '').trim() || null }));
   }
   if (p === '/api/connections' && m === 'POST') {
     const b = await readBody(req); const sub = parseSub(b.sub);
-    let c = b.reauth && db.connections.find(x => x.id === b.reauth);
-    if (!c) { if (!subOk(sub) || !b.cid || !b.sec) return send(req, res, 400, { error: 'Missing package details.' }); c = { id: 'c' + crypto.randomBytes(5).toString('hex'), created: new Date().toISOString() }; db.connections.push(c); }
-    Object.assign(c, { name: String(b.name || c.name || 'SFMC org').trim(), env: b.env || c.env || 'Production', sub: sub || c.sub, cid: String(b.cid || c.cid).trim(), mid: String(b.mid || c.mid || '').trim(), buOff: b.buOff || c.buOff || {}, buList: b.bus && b.bus.length ? b.bus : (c.buList || []), status: 'Connected', validated: fmtD(new Date()) + ' ' + new Date().toTimeString().slice(0, 5) });
-    if (b.sec) { c.secEnc = enc(String(b.sec).trim()); c.secretUpdated = new Date().toISOString(); }
-    save(); return send(req, res, 200, { connection: publicConn(c) });
+    const old = b.reauth ? await store.getConnection(b.reauth) : null, o = old || {};
+    if (!old && (!subOk(sub) || !b.cid || !b.sec)) return send(req, res, 400, { error: 'Missing package details.' });
+    const fields = { name: String(b.name || o.name || 'SFMC org').trim(), env: b.env || o.env || 'Production', sub: sub || o.sub, cid: String(b.cid || o.cid).trim(), mid: String(b.mid || o.mid || '').trim(), buOff: b.buOff || o.buOff || {}, buList: b.bus && b.bus.length ? b.bus : (o.buList || []), status: 'Connected', validated: stamp() };
+    if (b.sec) Object.assign(fields, { secEnc: enc(String(b.sec).trim()), secretUpdated: new Date().toISOString() });
+    let c;
+    if (old) c = await store.updateConnection(old.id, fields);
+    else { const id = 'c' + crypto.randomBytes(5).toString('hex'); await store.createConnection({ id, created: new Date().toISOString(), ...fields }); c = await store.getConnection(id); }
+    return send(req, res, 200, { connection: await pubConn(c) });
   }
   let mm = p.match(/^\/api\/connections\/([\w-]+)(?:\/(\w+))?$/);
   if (mm) {
-    const c = db.connections.find(x => x.id === mm[1]); if (!c) return send(req, res, 404, { error: 'Connection not found' });
+    const c = await store.getConnection(mm[1]); if (!c) return send(req, res, 404, { error: 'Connection not found' });
     const sub = mm[2];
-    if (!sub && m === 'DELETE') { db.connections = db.connections.filter(x => x !== c); delete db.scans[c.id]; delete db.triage[c.id]; save(); fs.rmSync(path.join(DATA, 'scans', c.id), { recursive: true, force: true }); return send(req, res, 200, { ok: true }); }
+    if (!sub && m === 'DELETE') { await store.deleteConnection(c.id); return send(req, res, 200, { ok: true }); }
     if (!sub && m === 'PATCH') {
       const b = await readBody(req);
       const next = { name: String(b.name != null ? b.name : c.name).trim() || c.name, env: ['Production', 'Sandbox'].includes(b.env) ? b.env : c.env, sub: b.sub ? parseSub(b.sub) : c.sub, cid: b.cid ? String(b.cid).trim() : c.cid, mid: b.mid != null ? String(b.mid).trim() : (c.mid || '') };
@@ -705,27 +719,29 @@ async function api(req, res, url) {
         const authOk = test.steps.length >= 2 && test.steps[0].ok && test.steps[1].ok;
         if (!authOk) return send(req, res, 400, { error: 'Connection test failed — nothing was saved. ' + ((test.steps.find(x => !x.ok) || {}).note || ''), test });
       }
-      Object.assign(c, next); if (sec) { c.secEnc = enc(sec); c.secretUpdated = new Date().toISOString(); }
-      if (test) { c.status = 'Connected'; c.validated = fmtD(new Date()) + ' ' + new Date().toTimeString().slice(0, 5); if (test.bus && test.bus.length) c.buList = test.bus; c.scopes = test.scopes || c.scopes; }
-      save(); return send(req, res, 200, { connection: publicConn(c), test, credsChanged });
+      const upd = { ...next };
+      if (sec) Object.assign(upd, { secEnc: enc(sec), secretUpdated: new Date().toISOString() });
+      if (test) Object.assign(upd, { status: 'Connected', validated: stamp(), scopes: test.scopes || c.scopes, ...(test.bus && test.bus.length ? { buList: test.bus } : {}) });
+      return send(req, res, 200, { connection: await pubConn(await store.updateConnection(c.id, upd)), test, credsChanged });
     }
-    if (sub === 'scans' && m === 'DELETE') { const n = (db.scans[c.id] || []).length; db.scans[c.id] = []; delete db.triage[c.id]; save(); fs.rmSync(path.join(DATA, 'scans', c.id), { recursive: true, force: true }); return send(req, res, 200, { deleted: n }); }
+    if (sub === 'scans' && m === 'DELETE') { const n = await store.clearScans(c.id); await store.putTriage(c.id, {}); return send(req, res, 200, { deleted: n }); }
     if (sub === 'export') {
-      const list = db.scans[c.id] || [];
-      const out = { exported: new Date().toISOString(), app: 'MCNexus ' + VERSION, connection: publicConn(c), scans: list.map(x => ({ summary: x, snapshot: loadScan(c.id, x.n) })), triage: db.triage[c.id] || {} };
+      const list = await store.listScans(c.id), scans = [];
+      for (const x of list) scans.push({ summary: x, snapshot: await store.getSnapshot(c.id, x.n) });
+      const out = { exported: new Date().toISOString(), app: 'MCNexus ' + VERSION, connection: publicConn(c, list), scans, triage: await store.getTriage(c.id) };
       return send(req, res, 200, JSON.stringify(out), { 'content-type': 'application/json; charset=utf-8', 'content-disposition': `attachment; filename="MCNexus_${String(c.name).replace(/[^A-Za-z0-9]+/g, '_')}_export.json"` });
     }
-    if (sub === 'access' && m === 'POST') { const r = await accessAssessment(c); c.access = r.rows; c.scopes = r.scopes; c.status = r.status; c.validated = fmtD(new Date()) + ' ' + new Date().toTimeString().slice(0, 5); save(); return send(req, res, 200, { connection: publicConn(c) }); }
-    if (sub === 'triage' && m === 'PUT') { const b = await readBody(req); db.triage[c.id] = b.fx || {}; save(); return send(req, res, 200, { ok: true }); }
+    if (sub === 'access' && m === 'POST') { const r = await accessAssessment(c); const nc = await store.updateConnection(c.id, { access: r.rows, scopes: r.scopes, status: r.status, validated: stamp() }); return send(req, res, 200, { connection: await pubConn(nc) }); }
+    if (sub === 'triage' && m === 'PUT') { const b = await readBody(req); await store.putTriage(c.id, b.fx || {}); return send(req, res, 200, { ok: true }); }
     if (sub === 'dataset') {
-      const list = db.scans[c.id] || []; const want = url.searchParams.get('scan'); const sm = (want && list.find(x => x.id === want)) || list[list.length - 1];
-      const ds = sm ? loadScan(c.id, sm.n) : null;
-      return send(req, res, 200, { connection: publicConn(c), scans: list, scan: sm || null, buList: c.buList || [], triage: db.triage[c.id] || {}, owners: db.users.map(u => u.name + ' · ' + u.role), ...(ds || {}) });
+      const list = await store.listScans(c.id); const want = url.searchParams.get('scan'); const sm = (want && list.find(x => x.id === want)) || list[list.length - 1];
+      const ds = sm ? await store.getSnapshot(c.id, sm.n) : null;
+      return send(req, res, 200, { connection: publicConn(c, list), scans: list, scan: sm || null, buList: c.buList || [], triage: await store.getTriage(c.id), owners: (await store.listUsers()).map(u => u.name + ' · ' + u.role), ...(ds || {}) });
     }
     if (sub === 'compare') {
-      const list = db.scans[c.id] || []; const A = list.find(x => x.id === url.searchParams.get('a')), B = list.find(x => x.id === url.searchParams.get('b'));
+      const list = await store.listScans(c.id); const A = list.find(x => x.id === url.searchParams.get('a')), B = list.find(x => x.id === url.searchParams.get('b'));
       if (!A || !B) return send(req, res, 400, { error: 'Pick two scans' });
-      const fa = (loadScan(c.id, A.n) || {}).findings || [], fb = (loadScan(c.id, B.n) || {}).findings || [];
+      const fa = ((await store.getSnapshot(c.id, A.n)) || {}).findings || [], fb = ((await store.getSnapshot(c.id, B.n)) || {}).findings || [];
       const ia = new Set(fa.map(f => f.id)), ib = new Set(fb.map(f => f.id));
       const row = (f) => [f.sev, f.rule, f.title + ' · ' + f.obj];
       const added = fb.filter(f => !ia.has(f.id)), resolved = fa.filter(f => !ib.has(f.id));
@@ -733,20 +749,27 @@ async function api(req, res, url) {
     }
   }
   if (p === '/api/scans' && m === 'POST') {
-    const b = await readBody(req); const c = db.connections.find(x => x.id === b.connId); if (!c) return send(req, res, 404, { error: 'Connection not found' });
+    const b = await readBody(req); const c = await store.getConnection(b.connId); if (!c) return send(req, res, 404, { error: 'Connection not found' });
+    // Check and register with no await in between, so two concurrent requests can't both start a scan.
     if (Object.values(jobs).some(j => j.connId === c.id && !j.done)) return send(req, res, 409, { error: 'A scan is already running for this connection.' });
-    const list = db.scans[c.id] = db.scans[c.id] || []; const n = (list.length ? list[list.length - 1].n : 0) + 1; const id = '#' + String(n).padStart(3, '0');
-    const job = jobs['j' + crypto.randomBytes(5).toString('hex')] = { connId: c.id, scanId: id, n, t0: Date.now(), pct: 0, cur: 'Starting', log: [], mods: {}, counts: { assets: 0, rels: 0, rules: 0, findings: 0, warnings: 0, errors: 0 }, done: false, error: null, cancelled: false };
-    const jobId = Object.keys(jobs).find(k => jobs[k] === job);
+    const jobId = 'j' + crypto.randomBytes(5).toString('hex');
+    const job = jobs[jobId] = { connId: c.id, scanId: null, n: 0, t0: Date.now(), pct: 0, cur: 'Starting', log: [], mods: {}, counts: { assets: 0, rels: 0, rules: 0, findings: 0, warnings: 0, errors: 0 }, done: false, error: null, cancelled: false };
+    let list, st; try { list = await store.listScans(c.id); st = await settings(); } catch (e) { delete jobs[jobId]; throw e; }
+    const n = (list.length ? list[list.length - 1].n : 0) + 1, id = '#' + String(n).padStart(3, '0');
+    job.n = n; job.scanId = id; applyLimits(st.scan);
     (async () => {
       try {
-        const { ds, api: cl } = await runScan(job, c, b);
+        const { ds, api: cl } = await runScan(job, c, { ...b, rulesX: st.rulesX });
         const sum = { n, id, date: fmtD(new Date()), iso: new Date().toISOString(), ...ds.summary, mode: String(b.mode || 'Full').split(' ')[0], by: me.name, dur: elapsed(job.t0), calls: cl.calls };
-        delete ds.summary; fs.mkdirSync(path.join(DATA, 'scans', c.id), { recursive: true });
-        fs.writeFileSync(scanPath(c.id, n), JSON.stringify({ ...ds, scan: sum }));
-        list.push(sum); prune(c.id); c.status = 'Connected'; save();
+        delete ds.summary;
+        if (!(await store.addScan(c.id, sum, { ...ds, scan: sum }))) throw new ApiErr('The connection was deleted during the scan — snapshot discarded', 0, 'gone');
+        await store.pruneScans(c.id, +st.data.keepScans || 0);
+        await store.updateConnection(c.id, { status: 'Connected' });
         job.pct = 100; job.cur = 'Complete'; job.log.unshift({ t: elapsed(job.t0), m: 'Scores calculated · snapshot ' + id + ' stored · ' + cl.calls + ' API calls' }); job.partial = ds.limits.length > 2;
-      } catch (e) { job.error = e.message; job.counts.errors++; job.log.unshift({ t: elapsed(job.t0), m: 'Scan stopped — ' + e.message }); if (e.status === 401 || e.code === 'auth') { c.status = 'Needs re-auth'; save(); } }
+      } catch (e) {
+        job.error = e.message; job.counts.errors++; job.log.unshift({ t: elapsed(job.t0), m: 'Scan stopped — ' + e.message });
+        if (e.status === 401 || e.code === 'auth') await store.updateConnection(c.id, { status: 'Needs re-auth' }).catch(() => { });
+      }
       job.done = true; setTimeout(() => delete jobs[jobId], 3600e3).unref();
     })();
     return send(req, res, 200, { jobId, scanId: id });
@@ -775,12 +798,16 @@ function serveStatic(req, res, url) {
 
 async function handle(req, res) {
   const url = new URL(req.url, 'http://x');
-  try { if (url.pathname.startsWith('/api/')) await api(req, res, url); else serveStatic(req, res, url); }
+  try {
+    if (!url.pathname.startsWith('/api/')) return serveStatic(req, res, url);
+    try { await ready(); } catch (e) { console.error('Store unavailable:', e.message); return send(req, res, 503, { ok: false, error: 'Storage unavailable — ' + e.message }); }
+    await api(req, res, url);
+  }
   catch (e) { console.error(e); send(req, res, e.status && e.status < 500 ? 400 : 500, { error: e.message }); }
 }
 
-if (require.main === module) http.createServer(handle).listen(PORT, HOST, () => console.log(`MCNexus ${VERSION} → http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}/  (data: ${DATA})`));
+if (require.main === module) http.createServer(handle).listen(PORT, HOST, () => console.log(`MCNexus ${VERSION} → http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}/  (storage: ${PG ? 'PostgreSQL' : DATA})`));
 
 // Internals exported for tests (test/). Set MCNEXUS_DATA / MCNEXUS_KEY before requiring: the store loads on require.
-module.exports = { handle, analyze, runScan, testConnection, SFMC, ApiErr, xmlObj, sqlSources, sqlDepth, patternRe, enc, dec, hid, score,
+module.exports = { handle, useStore, withDefaults, analyze, runScan, testConnection, SFMC, ApiErr, xmlObj, sqlSources, sqlDepth, patternRe, enc, dec, hid, score,
   RULES, RULE, RULESET, VERSION, DOMAINS, DOMAIN_OF, MODULES, SEVS, W, PEN, SECRET_RE, STATIC_OK };
